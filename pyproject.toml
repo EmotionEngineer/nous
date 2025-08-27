@@ -1,0 +1,37 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nous"
+version = "0.1.0"
+description = "Nous: A Neuro-Symbolic Library for Interpretable and Causal Reasoning AI"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Islam Tlupov", email = "tlupovislam@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed"
+]
+dependencies = [
+    "torch>=1.8.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0",
+    "matplotlib>=3.3.0",
+    "networkx>=2.6",
+    "seaborn>=0.11"
+]
+
+[project.urls]
+Homepage = "https://github.com/EmotionEngineer/nous"
+Repository = "https://github.com/EmotionEngineer/nous"
