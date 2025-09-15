@@ -1,90 +1,66 @@
 # Nous: A Neuro-Symbolic Library for Interpretable AI
 
-[![PyPI version](https://badge.fury.io/py/nous.svg)](https://badge.fury.io/py/nous)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+Nous is a rule-based neural network with honest, fidelity-preserving interpretability for classification and regression. It combines:
+- Beta fact activations over calibrated inputs,
+- Rule layers with explicit aggregator mixtures (AND, OR, k-of-n, NOT),
+- Honest leave-one-out explanations (pre-gating recomputation),
+- Fidelity-driven pruning,
+- Minimal Sufficient Explanations (MSE) via greedy elimination,
+- Prototype head (optional) and end-to-end tracing: prototype → rule → β-facts,
+- Sparse Hard-Concrete connections with L0 scheduling,
+- NumPy-only export with probability-first validation.
 
-**Nous** is a PyTorch-based library for building "white-box" machine learning models for both **regression** and **classification**. It enables models that don't just predict, but also **reason** and **explain** their decisions in human-understandable terms.
-
-## Key Features
-
--   **Deeply Interpretable**: Generate a complete, step-by-step logical trace (`fact -> rule -> concept -> prediction`) for any decision.
--   **Supports Regression & Classification**: A unified API for predicting both continuous values and class probabilities.
--   **Causal by Design**: Natively supports counterfactual analysis ("What if?") to provide actionable recommendations for both regression and classification tasks.
--   **High Performance**: Achieves accuracy competitive with traditional black-box models.
--   **Scalable & Flexible**: Choose between a high-performance `beta` activation, a robust `sigmoid`, or a maximally transparent `exhaustive` fact layer.
+This package provides production-ready modules, tests, and examples.
 
 ## Installation
-
 ```bash
 pip install nous
 ```
 
-## Quickstart: A 5-Minute Example (Regression)
-
-Let's predict a house price and understand the model's reasoning.
+## Quickstart
 
 ```python
 import torch
-import pandas as pd
-from sklearn.datasets import make_regression
-from nous.models import NousNet
-from nous.interpret import trace_decision_graph, explain_fact
-from nous.causal import find_counterfactual
+from nous import NousNet
 
-# 1. Prepare Data
-X_raw, y = make_regression(n_samples=1000, n_features=5, n_informative=3, noise=20, random_state=42)
-feature_names = ['area_sqft', 'num_bedrooms', 'dist_to_center', 'age_years', 'renovation_quality']
-X = torch.tensor(X_raw, dtype=torch.float32)
-y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
-
-# 2. Define and Train a NousNet for Regression
+# Build a small classifier
 model = NousNet(
-    input_dim=5,
-    output_dim=1, # Single output for regression
-    feature_names=feature_names,
-    fact_layer_type='beta'
+    input_dim=20,
+    num_outputs=3,
+    task_type="classification",
+    num_facts=32,
+    rules_per_layer=(16, 8),
+    rule_selection_method="softmax",
+    use_calibrators=True,
+    use_prototypes=False
 )
-# Training: Use a regression loss like nn.MSELoss
-# loss_fn = torch.nn.MSELoss()
-# ... (standard training loop omitted)
-model.eval()
 
-# 3. Analyze a specific house
-x_sample = X[50]
-predicted_price = model(x_sample).item()
-print(f"Model's predicted price for house #50: ${predicted_price:,.2f}")
+x = torch.randn(4, 20)
+logits = model(x)  # [4, 3]
 
-# 4. Get the Step-by-Step Reasoning
-graph = trace_decision_graph(model, x_sample)
-top_facts = sorted(graph['trace']['Atomic Facts'].items(), key=lambda i: i[1]['value'], reverse=True)
-fact_to_analyze = top_facts[0][0]
-print(f"\nTop activated fact influencing the price: '{fact_to_analyze}'")
-
-# 5. Decode the Learned Fact
-details_df = explain_fact(model, fact_name=fact_to_analyze)
-print(f"\nDecoding '{fact_to_analyze}':")
-display(details_df.head())
-
-# 6. Get an Actionable Recommendation
-# What's the smallest change to increase the predicted price to $150,000?
-recommendation = find_counterfactual(
-    model,
-    x_sample,
-    target_output=150.0, # Target value for regression
-    task='regression'
-)
-print("\nRecommendation to increase value to $150k:")
-for feature, old_val, new_val in recommendation['changes']:
-    print(f"- Change '{feature}' from {old_val:.2f} to {new_val:.2f}")
-
+# Honest explain for a single sample
+probas, logits1, internals = model.forward_explain(x[0])
 ```
 
-## Choosing a `fact_layer_type`
+## Key features
+- Honest LOO: rule removal before top-k, full top-k recomputation; frozen modes supported.
+- Clean explanations: disable LayerNorm and exclude residual projection when desired.
+- Fidelity-driven pruning: grid and binary search selection with fidelity or MAE constraints.
+- MSE: greedy backward elimination that preserves the prediction under tolerances.
+- Rule-based counterfactuals via β-fact geometry (with calibrators).
+- Aggregator mixtures reported as soft mixtures (not argmax).
+- Sparse L0: Hard-Concrete gates, safe sampling, schedulers for regression.
+- Prototypes: global report, per-sample contributions, tracing to β-facts.
+- NumPy-only export and validator (probability-first).
 
--   `'beta'` (**Default, Recommended**): Best performance and flexibility.
--   `'sigmoid'`: A robust and reliable alternative.
--   `'exhaustive'`: Maximum transparency. Best for low-dimensional problems (<15 features).
+## Examples
+See the `examples/` directory for:
+- Wine classification,
+- California housing regression,
+- NumPy export and validation.
+
+## Contributing
+See CONTRIBUTING.md
 
 ## License
-
-This project is licensed under the MIT License.
+MIT License. See LICENSE.
