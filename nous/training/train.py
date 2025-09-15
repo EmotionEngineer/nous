@@ -63,7 +63,11 @@ def train_model(
             optimizer.zero_grad()
 
             outputs = model(X_batch)
-            loss = criterion(outputs, y_batch if outputs.ndim == y_batch.ndim else y_batch.float())
+            if isinstance(criterion, nn.CrossEntropyLoss) or (outputs.ndim == 2 and outputs.size(-1) > 1):
+                target = y_batch.long()    # classification
+            else:
+                target = y_batch.float()   # regression
+            loss = criterion(outputs, target)
 
             l0_loss = getattr(model, "compute_total_l0_loss", lambda: torch.tensor(0.0, device=device))()
             total_loss = loss + l0_loss
@@ -88,7 +92,11 @@ def train_model(
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
-                vloss = criterion(outputs, y_batch if outputs.ndim == y_batch.ndim else y_batch.float())
+                if isinstance(criterion, nn.CrossEntropyLoss) or (outputs.ndim == 2 and outputs.size(-1) > 1):
+                    target = y_batch.long()
+                else:
+                    target = y_batch.float()
+                vloss = criterion(outputs, target)
                 total_val_loss += float(vloss.item())
         avg_val_loss = total_val_loss / max(1, len(val_loader))
 
