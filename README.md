@@ -1,7 +1,6 @@
 # Nous — A Neuro-Symbolic Library for Interpretable AI
 
 [![PyPI](https://img.shields.io/pypi/v/nous.svg)](https://pypi.org/project/nous/)
-[![Python](https://img.shields.io/pypi/pyversions/nous.svg)](https://pypi.org/project/nous/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Make tabular models you can read.  
