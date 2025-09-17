@@ -1,66 +1,90 @@
-# Nous: A Neuro-Symbolic Library for Interpretable AI
+# Nous — A Neuro-Symbolic Library for Interpretable AI
 
-Nous is a rule-based neural network with honest, fidelity-preserving interpretability for classification and regression. It combines:
-- Beta fact activations over calibrated inputs,
-- Rule layers with explicit aggregator mixtures (AND, OR, k-of-n, NOT),
-- Honest leave-one-out explanations (pre-gating recomputation),
-- Fidelity-driven pruning,
-- Minimal Sufficient Explanations (MSE) via greedy elimination,
-- Prototype head (optional) and end-to-end tracing: prototype → rule → β-facts,
-- Sparse Hard-Concrete connections with L0 scheduling,
-- NumPy-only export with probability-first validation.
+[![PyPI](https://img.shields.io/pypi/v/nous.svg)](https://pypi.org/project/nous/)
+[![Python](https://img.shields.io/pypi/pyversions/nous.svg)](https://pypi.org/project/nous/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-This package provides production-ready modules, tests, and examples.
+Make tabular models you can read.  
+Nous learns compact logical rules and optional case‑based prototypes inside one differentiable model — so prediction and explanation come from the same place.
+
+- 🧩 One white‑box → two styles: rules and/or prototypes
+- 🔀 Learned AND / OR / k‑of‑n mixtures capture interactions without bloat
+- ✂️ Minimal, faithful stories: pruning + sufficiency/comprehensiveness checks
+- 🚀 Practical: competitive accuracy, NumPy export, unit‑tested toolkit
+
+## Key Features
+
+- Intrinsic interpretability (not post‑hoc): explanations are part of the forward pass
+- Switchable style: enable/disable prototypes; choose rule selection (fixed / softmax / sparse); add calibrators
+- Fidelity diagnostics: pruned‑forward inference, minimal‑sufficient explanations, stability tools
+- Ready to ship: pure‑NumPy export for inference without PyTorch
 
 ## Installation
+
 ```bash
+# Stable from PyPI
 pip install nous
+
+# With example extras (plots, progress, UCI fetchers)
+pip install "nous[examples]"
+
+# Dev setup (tests, linters, type checks)
+pip install "nous[dev]"
 ```
 
-## Quickstart
+Requirements (core):
+- Python 3.9+
+- torch>=2.1
+- numpy>=1.22
+- pandas>=1.5
+- scikit-learn>=1.2
 
-```python
-import torch
-from nous import NousNet
+Extras:
+- examples: matplotlib>=3.6, seaborn>=0.12, tqdm>=4.65, ucimlrepo>=0.0.5
+- dev: pytest>=7.0, pytest-cov>=4.0, mypy>=1.5, ruff>=0.5, black>=23.0, matplotlib>=3.6, seaborn>=0.12, tqdm>=4.65, ucimlrepo>=0.0.5
 
-# Build a small classifier
-model = NousNet(
-    input_dim=20,
-    num_outputs=3,
-    task_type="classification",
-    num_facts=32,
-    rules_per_layer=(16, 8),
-    rule_selection_method="softmax",
-    use_calibrators=True,
-    use_prototypes=False
-)
+## Recommended Configurations
 
-x = torch.randn(4, 20)
-logits = model(x)  # [4, 3]
+| Profile | Rule selection | Calibrators | Prototypes | Use when | Speed |
+|--------|-----------------|-------------|------------|----------|-------|
+| Fast baseline | fixed | off | off | quick sweeps, ablations | ⚡⚡⚡ |
+| Default rules | softmax | on  | off | general use, strong accuracy | ⚡⚡ |
+| Explain‑everything | softmax | on  | on  | rich case‑based narratives | ⚡ |
 
-# Honest explain for a single sample
-probas, logits1, internals = model.forward_explain(x[0])
-```
+Tips:
+- Train with prototypes off for speed; enable them only on the final model if you need case‑based stories.
+- 300 epochs with patience≈50 works well on common tabular datasets.
 
-## Key features
-- Honest LOO: rule removal before top-k, full top-k recomputation; frozen modes supported.
-- Clean explanations: disable LayerNorm and exclude residual projection when desired.
-- Fidelity-driven pruning: grid and binary search selection with fidelity or MAE constraints.
-- MSE: greedy backward elimination that preserves the prediction under tolerances.
-- Rule-based counterfactuals via β-fact geometry (with calibrators).
-- Aggregator mixtures reported as soft mixtures (not argmax).
-- Sparse L0: Hard-Concrete gates, safe sampling, schedulers for regression.
-- Prototypes: global report, per-sample contributions, tracing to β-facts.
-- NumPy-only export and validator (probability-first).
+## Bench Snapshot (5‑fold CV, typical)
 
-## Examples
-See the `examples/` directory for:
-- Wine classification,
-- California housing regression,
-- NumPy export and validation.
+| Dataset | Metric | Nous (rules) | Nous (+proto) | EBM | XGBoost |
+|--------|--------|--------------|---------------|-----|---------|
+| HELOC (cls) | AUC | ~0.791 | ~0.792 | ~0.799 | ~0.796 |
+| Adult (cls) | AUC | ~0.913 | ~0.914 | ~0.926 | ~0.929 |
+| Breast Cancer (cls) | Acc | ~0.975 | ~0.983 | ~0.970 | ~0.965 |
+| California (reg) | RMSE | ~0.514 | ~0.505 | ~0.562 | ~0.439 |
 
-## Contributing
-See CONTRIBUTING.md
+Numbers vary with seed/HPO. See examples/benchmark.ipynb for reproducible runs.
+
+## What makes Nous different?
+
+- The explanation is the model: rules and prototypes live in the forward pass
+- Interactions without clutter: AND/OR/k‑of‑n mixtures keep explanations short
+- Verified stories: minimal‑sufficient explanations + pruned‑forward confidence checks
+- Lightweight deployment: NumPy export (no torch at inference)
+
+## Repository Layout
+
+- examples/
+  - benchmark.ipynb — end‑to‑end comparison on classic tabular data
+  - wine_classification.py, california_regression.py — minimal scripts
+  - export_numpy_demo.py — deploy without torch
+- nous/
+  - model.py (NousNet), facts.py (calibrated L−R facts)
+  - rules/* (fixed/softmax/sparse), explain/* (pruning, fidelity, traces, prototypes)
+  - training/* (loop, schedulers), export/* (NumPy), utils/*
+- tests/ — unit tests for forward, rules, facts, prototypes, explanations, export
 
 ## License
-MIT License. See LICENSE.
+
+MIT — see LICENSE.
