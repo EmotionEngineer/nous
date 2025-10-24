@@ -30,3 +30,15 @@ def test_regression_forward_shapes():
     x = torch.randn(7, 10)
     y = model(x)
     assert y.shape == (7,)
+
+def test_classification_soft_fact():
+    model = NousNet(
+        input_dim=8,
+        num_outputs=3,
+        task_type="classification",
+        rule_selection_method="soft_fact",
+        use_calibrators=False
+    )
+    x = torch.randn(5, 8)
+    out = model(x)
+    assert out.shape == (5, 3)

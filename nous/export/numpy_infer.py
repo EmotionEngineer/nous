@@ -101,7 +101,20 @@ def export_numpy_inference(model: NousNet, file_path: str = "nous_numpy_infer.py
                     rule_strength=rule_strength.tolist(),
                     top_k_rules=int(blk.top_k_rules)
                 ))
-
+        elif isinstance(blk, SoftFactRuleLayer):
+            with torch.no_grad():
+                mask = blk._soft_k_mask().cpu().numpy().astype(np.float32)
+                agg_w = F.softmax(blk.aggregator_logits, dim=1).cpu().numpy().astype(np.float32)
+                rule_strength = torch.sigmoid(blk.rule_strength_raw).cpu().numpy().astype(np.float32)
+                blocks.append(dict(
+                    kind="soft_fact",
+                    proj_W=proj_W,
+                    ln_w=ln_w, ln_b=ln_b,
+                    mask=mask.tolist(),
+                    agg_w=agg_w.tolist(),
+                    rule_strength=rule_strength.tolist(),
+                    top_k_rules=int(blk.top_k_rules)
+                ))
         elif isinstance(blk, SparseRuleLayer):
             with torch.no_grad():
                 beta = blk.hard_concrete.beta.detach().cpu().numpy()
@@ -220,6 +233,28 @@ def run_block(block, H):
         sel = H[:, None, :] * mask[None, :, :]
         and_agg = np.prod(sel + (1.0 - mask)[None, :, :], axis=2)
         or_agg  = 1.0 - np.prod((1.0 - sel) * mask[None, :, :] + (1.0 - mask)[None, :, :], axis=2)
+        denom = np.maximum(mask.sum(axis=1), 1e-8)  # [R]
+        kofn  = (sel.sum(axis=2)) / denom[None, :]
+        agg_w = np.array(block['agg_w'], dtype=np.float32)  # [R,3]
+        aggs = np.stack([and_agg, or_agg, kofn], axis=2)
+        mixed = (aggs * agg_w[None, :, :]).sum(axis=2)
+        rs = np.array(block['rule_strength'], dtype=np.float32)
+        rule_act = mixed * rs[None, :]
+        R = mask.shape[0]
+        k_rules = int(block['top_k_rules'])
+        if k_rules < R:
+            gate = np.zeros_like(rule_act, dtype=np.float32)
+            idx_top = np.argpartition(rule_act, -k_rules, axis=1)[:, -k_rules:]
+            for i in range(rule_act.shape[0]):
+                gate[i, idx_top[i]] = 1.0
+            rule_act = rule_act * gate
+        pre = proj + rule_act
+
+    elif kind == 'soft_fact':
+        mask = np.array(block['mask'], dtype=np.float32)  # [R,F] — soft!
+        sel = H[:, None, :] * mask[None, :, :]
+        and_agg = np.prod(sel + (1.0 - mask)[None, :, :], axis=2)
+        or_agg  = 1.0 - np.prod((1.0 - sel) + 1e-8, axis=2)
         denom = np.maximum(mask.sum(axis=1), 1e-8)  # [R]
         kofn  = (sel.sum(axis=2)) / denom[None, :]
         agg_w = np.array(block['agg_w'], dtype=np.float32)  # [R,3]

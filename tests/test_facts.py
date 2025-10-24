@@ -14,3 +14,13 @@ def test_calibrator_monotonic():
     y = cal(x)
     # monotonic non-decreasing
     assert torch.all(y[1:] >= y[:-1])
+
+def test_quantile_calibrator():
+    edges = torch.linspace(-1.0, 1.0, 9)
+    cal = PiecewiseLinearCalibratorQuantile(edges)
+    x = torch.linspace(-1.0, 1.0, 21)
+    y = cal(x)
+    assert torch.all(y[1:] >= y[:-1])  # monotonic
+    assert cal.local_slope(x).shape == x.shape
+    y_inv = cal.inverse(y)
+    assert torch.allclose(x, y_inv, atol=1e-2)

@@ -31,3 +31,13 @@ def test_sparse_rule_layer_train_eval():
     assert y2.shape == (2, 4)
     l0 = layer.compute_l0_loss()
     assert l0 >= 0.0
+
+def test_soft_fact_rule_layer():
+    layer = SoftFactRuleLayer(input_dim=10, num_rules=6, top_k_facts=3)
+    x = torch.rand(4, 10)
+    y, details = layer(x, return_details=True)
+    assert y.shape == (4, 6)
+    assert "fact_weights" in details
+    assert details["fact_weights"].shape == (6, 10)
+    assert torch.all(details["fact_weights"] >= 0)
+    assert torch.all(details["fact_weights"] <= 1)

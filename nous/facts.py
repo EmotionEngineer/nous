@@ -110,3 +110,53 @@ class PiecewiseLinearCalibrator(nn.Module):
         x_norm = (idx.float() + t) / self.num_bins
         x = x_norm * (self.input_max - self.input_min) + self.input_min
         return x.view_as(y)
+
+class PiecewiseLinearCalibratorQuantile(nn.Module):
+    """
+    Monotonic piecewise-linear calibrator with bin edges defined by empirical quantiles.
+    Edges are fixed at construction time (non-learnable); only slopes and bias are learned.
+    """
+    def __init__(self, edges: torch.Tensor) -> None:
+        super().__init__()
+        if edges.ndim != 1 or len(edges) < 2:
+            raise ValueError("edges must be a 1D tensor with at least 2 elements")
+        self.register_buffer('edges', edges.float())
+        self.num_bins = edges.numel() - 1
+        self.deltas = nn.Parameter(torch.ones(self.num_bins) * 0.1)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bin_idx = torch.searchsorted(self.edges, x, right=True) - 1
+        bin_idx = torch.clamp(bin_idx, 0, self.num_bins - 1)
+        cum_deltas = torch.cumsum(F.softplus(self.deltas), dim=0)
+        cum_deltas = torch.cat([torch.zeros(1, device=x.device), cum_deltas])
+        left_vals = self.bias + cum_deltas[bin_idx]
+        right_vals = self.bias + cum_deltas[bin_idx + 1]
+        left_edge = self.edges[bin_idx]
+        right_edge = self.edges[bin_idx + 1]
+        t = (x - left_edge) / (right_edge - left_edge + 1e-8)
+        t = torch.clamp(t, 0.0, 1.0)
+        return left_vals + t * (right_vals - left_vals)
+
+    def local_slope(self, x: torch.Tensor) -> torch.Tensor:
+        bin_idx = torch.searchsorted(self.edges, x, right=True) - 1
+        bin_idx = torch.clamp(bin_idx, 0, self.num_bins - 1)
+        deltas_sp = F.softplus(self.deltas)
+        slope = deltas_sp[bin_idx] / (self.edges[bin_idx + 1] - self.edges[bin_idx] + 1e-8)
+        return torch.clamp(slope, min=1e-6)
+
+    @torch.no_grad()
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        device = y.device
+        deltas_sp = F.softplus(self.deltas)
+        cum = torch.cumsum(deltas_sp, dim=0)
+        cum = torch.cat([torch.zeros(1, device=device), cum])
+        vals = self.bias + cum
+        y_flat = y.view(-1)
+        idx = torch.searchsorted(vals, y_flat, right=True) - 1
+        idx = torch.clamp(idx, 0, self.num_bins - 1)
+        y_left = vals[idx]
+        y_right = vals[idx + 1]
+        t = (y_flat - y_left) / torch.clamp((y_right - y_left), min=1e-6)
+        x = self.edges[idx] + t * (self.edges[idx + 1] - self.edges[idx])
+        return x.view_as(y)

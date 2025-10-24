@@ -19,15 +19,16 @@ class NousNet(nn.Module):
         self,
         input_dim: int,
         num_outputs: int,
-        task_type: str = "classification",     # "classification" | "regression"
+        task_type: str = "classification",
         feature_names: Optional[Sequence[str]] = None,
         num_facts: int = 48,
         rules_per_layer: Sequence[int] = (24, 12),
         use_calibrators: bool = False,
-        rule_selection_method: str = "fixed",  # "fixed" | "softmax" | "sparse"
+        rule_selection_method: str = "fixed",
         use_prototypes: bool = False,
         l0_lambda: float = 1e-3,
-        hc_temperature: float = 0.1
+        hc_temperature: float = 0.1,
+        custom_calibrators: Optional[nn.ModuleList] = None,
     ) -> None:
         super().__init__()
         self.config = {
@@ -38,14 +39,14 @@ class NousNet(nn.Module):
             'use_prototypes': bool(use_prototypes and task_type == "classification"),
             'l0_lambda': l0_lambda, 'hc_temperature': hc_temperature
         }
-
-        if self.config['use_calibrators']:
+        if custom_calibrators is not None:
+            self.calibrators = custom_calibrators
+        elif use_calibrators:
             self.calibrators = nn.ModuleList([PiecewiseLinearCalibrator() for _ in range(input_dim)])
         else:
             self.calibrators = None
 
         self.fact = BetaFactLayer(input_dim, num_facts)
-
         blocks: List[nn.Module] = []
         cur = num_facts
         for r in rules_per_layer:
@@ -55,16 +56,16 @@ class NousNet(nn.Module):
                 blocks.append(SoftmaxRuleLayer(cur, r))
             elif rule_selection_method == 'sparse':
                 blocks.append(SparseRuleLayer(cur, r, l0_lambda=l0_lambda, hc_temperature=hc_temperature))
+            elif rule_selection_method == 'soft_fact':
+                blocks.append(SoftFactRuleLayer(cur, r))
             else:
                 raise ValueError(f"Unknown rule_selection_method: {rule_selection_method}")
             cur = r
         self.blocks = nn.ModuleList(blocks)
-
         if self.config['use_prototypes']:
             self.head = ScaledPrototypeLayer(cur, num_prototypes=10, num_classes=num_outputs)
         else:
             self.head = nn.Linear(cur, num_outputs)
-
         if self.config['task_type'] == "regression" and self.config['num_outputs'] != 1:
             self.config['num_outputs'] = 1
             if isinstance(self.head, nn.Linear):

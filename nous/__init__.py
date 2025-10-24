@@ -1,8 +1,8 @@
 from .version import __version__
 from .model import NousNet
-from .facts import BetaFactLayer, PiecewiseLinearCalibrator
+from .facts import BetaFactLayer, PiecewiseLinearCalibrator, PiecewiseLinearCalibratorQuantile
 from .prototypes import ScaledPrototypeLayer
-from .rules import FixedPairRuleLayer, SoftmaxRuleLayer, SparseRuleLayer, SimpleNousBlock
+from .rules import FixedPairRuleLayer, SoftmaxRuleLayer, SparseRuleLayer, SoftFactRuleLayer, SimpleNousBlock
 
 # Explainability (core API)
 from .explain import (
@@ -63,6 +63,7 @@ __all__ = [
     "FixedPairRuleLayer",
     "SoftmaxRuleLayer",
     "SparseRuleLayer",
+    "SoftFactRuleLayer",
     "SimpleNousBlock",
     # Explainability (core)
     "rule_impact_df",
