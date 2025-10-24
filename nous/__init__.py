@@ -51,7 +51,7 @@ from .training import (
 from .data import get_wine_data, get_california_housing_data
 
 # Utilities
-from .utils import set_global_seed
+from .utils import set_global_seed, make_quantile_calibrators
 
 __all__ = [
     "__version__",
@@ -101,4 +101,5 @@ __all__ = [
     "get_california_housing_data",
     # Utilities
     "set_global_seed",
+    "make_quantile_calibrators",
 ]
