@@ -1,5 +1,5 @@
 import torch
-from nous.facts import BetaFactLayer, PiecewiseLinearCalibrator
+from nous.facts import BetaFactLayer, PiecewiseLinearCalibrator, PiecewiseLinearCalibratorQuantile
 
 def test_beta_fact_layer_forward():
     layer = BetaFactLayer(input_dim=4, num_facts=6)

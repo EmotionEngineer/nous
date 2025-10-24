@@ -1,5 +1,5 @@
 import torch
-from nous.rules import FixedPairRuleLayer, SoftmaxRuleLayer, SparseRuleLayer, SimpleNousBlock
+from nous.rules import FixedPairRuleLayer, SoftmaxRuleLayer, SparseRuleLayer, SoftFactRuleLayer, SimpleNousBlock
 
 def test_fixed_pair_rule_layer():
     layer = FixedPairRuleLayer(input_dim=8, num_rules=5)

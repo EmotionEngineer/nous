@@ -5,11 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from .facts import BetaFactLayer, PiecewiseLinearCalibrator
+from .facts import BetaFactLayer, PiecewiseLinearCalibrator, PiecewiseLinearCalibratorQuantile
 from .prototypes import ScaledPrototypeLayer
 from .rules.blocks import SimpleNousBlock
 from .rules.softmax import SoftmaxRuleLayer
 from .rules.sparse import SparseRuleLayer
+from .rules import SoftFactRuleLayer
 
 class NousNet(nn.Module):
     """
