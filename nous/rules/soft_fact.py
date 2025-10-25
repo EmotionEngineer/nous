@@ -91,6 +91,8 @@ class SoftFactRuleLayer(nn.Module):
         output = pre_sum if explain_disable_norm else self.norm(pre_sum)
 
         if return_details:
+                with torch.no_grad():
+                	_, topk_fact_idx = torch.topk(mask, k=min(self.top_k_facts, self.input_dim), dim=1)
             details = {
                 "pre_rule_activations": rule_activations.detach(),
                 "gated_activations": gated_activations.detach(),
@@ -98,6 +100,7 @@ class SoftFactRuleLayer(nn.Module):
                 "aggregator_weights": agg_weights.detach(),
                 "selected_indices": topk_rule_idx.detach(),
                 "fact_weights": mask.detach(),
+                "facts_used": topk_fact_idx.detach(),
                 "pre_norm_sum": pre_sum.detach(),
                 "proj_contrib": proj_contrib.detach(),
             }

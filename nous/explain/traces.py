@@ -26,6 +26,7 @@ def get_last_block_static_metadata(model: NousNet, top_k_facts_override: Optiona
     from ..rules.blocks import SimpleNousBlock
     from ..rules.softmax import SoftmaxRuleLayer
     from ..rules.sparse import SparseRuleLayer
+    from ..rules.soft_fact import SoftFactRuleLayer
 
     if isinstance(blk, SimpleNousBlock):
         facts_used = blk.rule.idx.detach().cpu().numpy()  # [R, 2]
@@ -34,6 +35,11 @@ def get_last_block_static_metadata(model: NousNet, top_k_facts_override: Optiona
         fl = F.softmax(blk.fact_logits, dim=1)
         _, topk = torch.topk(fl, k=min(k, blk.input_dim), dim=1)
         facts_used = topk.detach().cpu().numpy()  # [R, k]
+    elif isinstance(blk, SoftFactRuleLayer):
+        k = top_k_facts_override or getattr(blk, "top_k_facts", 2)
+        mask = blk._soft_k_mask().detach()
+        _, topk = torch.topk(mask, k=min(k, blk.input_dim), dim=1)
+        facts_used = topk.cpu().numpy()
     elif isinstance(blk, SparseRuleLayer):
         k = top_k_facts_override or getattr(blk, "top_k_facts", 2)
         prob = blk.hard_concrete.get_proba().detach()
@@ -49,6 +55,7 @@ def _block_fact_mapping(block, top_k_per_rule: int = 2):
     from ..rules.blocks import SimpleNousBlock
     from ..rules.softmax import SoftmaxRuleLayer
     from ..rules.sparse import SparseRuleLayer
+    from ..rules.soft_fact import SoftFactRuleLayer
 
     if isinstance(block, SimpleNousBlock):
         return block.rule.idx.detach().cpu().numpy()
@@ -56,6 +63,10 @@ def _block_fact_mapping(block, top_k_per_rule: int = 2):
         fl = F.softmax(block.fact_logits, dim=1)
         _, topk = torch.topk(fl, k=min(top_k_per_rule, block.input_dim), dim=1)
         return topk.detach().cpu().numpy()
+    elif isinstance(block, SoftFactRuleLayer):
+        mask = block._soft_k_mask().detach()
+        _, topk = torch.topk(mask, k=min(top_k_per_rule, block.input_dim), dim=1)
+        return topk.cpu().numpy()
     elif isinstance(block, SparseRuleLayer):
         prob = block.hard_concrete.get_proba().detach()
         _, topk = torch.topk(prob, k=min(top_k_per_rule, block.input_dim), dim=1)

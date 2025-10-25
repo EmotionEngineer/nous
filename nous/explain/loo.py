@@ -71,8 +71,11 @@ def rule_impact_df(
             agg_w = agg_w.cpu()
 
         facts_used = details.get('facts_used', None)
+        fact_weights = details.get('fact_weights', None)
         if isinstance(facts_used, torch.Tensor):
             facts_used = facts_used.cpu().numpy()
+        if isinstance(fact_weights, torch.Tensor):
+            fact_weights = fact_weights.detach().cpu().numpy()
 
         for r in active_rules:
             drop_spec = (b_idx, int(r))
@@ -93,8 +96,19 @@ def rule_impact_df(
                 used = facts_used[r]
                 if np.ndim(used) == 0:
                     used = [int(used)]
-                facts_str = ", ".join([f"F{int(fid)+1}" for fid in used])
-                facts_str += "  →  " + " | ".join([f"[F{int(fid)+1}] {fact_desc[int(fid)]}" for fid in used])
+                else:
+                    used = [int(u) for u in used.tolist()]
+            
+                if fact_weights is not None and fact_weights.shape[0] > r:
+                    weights_row = fact_weights[r]
+                    used_pairs = [(fid, float(weights_row[fid])) for fid in used]
+                    used_pairs.sort(key=lambda t: -abs(t[1]))
+                    left = ", ".join([f"F{fid+1} (w={w:.2f})" for fid, w in used_pairs])
+                else:
+                    left = ", ".join([f"F{fid+1}" for fid in used])
+            
+                right = " | ".join([f"[F{fid+1}] {fact_desc[fid]}" for fid in used])
+                facts_str = f"{left}  →  {right}"
 
             if task == "classification":
                 drop_logits = np.array(drop_logits)
