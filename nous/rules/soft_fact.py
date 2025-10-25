@@ -46,53 +46,60 @@ class SoftFactRuleLayer(nn.Module):
         explain_disable_norm: bool = False,
         explain_exclude_proj: bool = False,
     ):
-        mask = self._soft_k_mask()
-        facts_exp = facts.unsqueeze(1)
-        mask_exp = mask.unsqueeze(0)
-        selected = facts_exp * mask_exp
-
-        and_agg = torch.prod(selected + (1.0 - mask_exp), dim=2)
-        or_agg = 1.0 - torch.prod(1.0 - selected + 1e-8, dim=2)
-        denom = mask_exp.sum(dim=2) + 1e-8
-        k_of_n_agg = selected.sum(dim=2) / denom
-
-        agg_weights = F.softmax(self.aggregator_logits, dim=1)
-        aggregators = torch.stack([and_agg, or_agg, k_of_n_agg], dim=2)
-        mixed_agg = (aggregators * agg_weights.unsqueeze(0)).sum(dim=2)
-
-        rule_strength = torch.sigmoid(self.rule_strength_raw)
-        rule_activations = mixed_agg * rule_strength.unsqueeze(0)
-
+        # Soft mask over facts
+        mask = self._soft_k_mask()                          # [R, F]
+        facts_exp = facts.unsqueeze(1)                      # [B, 1, F]
+        mask_exp = mask.unsqueeze(0)                        # [1, R, F]
+        selected = facts_exp * mask_exp                     # [B, R, F]
+    
+        # Aggregators
+        and_agg = torch.prod(selected + (1.0 - mask_exp), dim=2)                 # [B, R]
+        or_agg = 1.0 - torch.prod(1.0 - selected + 1e-8, dim=2)                  # [B, R]
+        denom = mask_exp.sum(dim=2) + 1e-8                                       # [1, R]
+        k_of_n_agg = selected.sum(dim=2) / denom                                  # [B, R]
+    
+        agg_weights = F.softmax(self.aggregator_logits, dim=1)                    # [R, A]
+        aggregators = torch.stack([and_agg, or_agg, k_of_n_agg], dim=2)           # [B, R, 3]
+        mixed_agg = (aggregators * agg_weights.unsqueeze(0)).sum(dim=2)           # [B, R]
+    
+        # Rule strength and activations
+        rule_strength = torch.sigmoid(self.rule_strength_raw)                     # [R]
+        rule_activations = mixed_agg * rule_strength.unsqueeze(0)                 # [B, R]
+    
+        # Per-sample top-k rules gating
         pre_for_topk = rule_activations.clone()
         if restrict_mask is not None:
             pre_for_topk = pre_for_topk + (restrict_mask - 1) * 1e9
         if drop_rule_idx is not None:
             pre_for_topk[:, drop_rule_idx] = -1e9
-
+    
         k = min(self.top_k_rules, self.num_rules)
-        _, topk_rule_idx = torch.topk(pre_for_topk, k=k, dim=1)
-        gate_mask = torch.zeros_like(rule_activations)
+        _, topk_rule_idx = torch.topk(pre_for_topk, k=k, dim=1)                   # [B, k]
+        gate_mask = torch.zeros_like(rule_activations)                            # [B, R]
         gate_mask.scatter_(1, topk_rule_idx, 1.0)
-
+    
         if restrict_mask is not None:
             gate_mask = gate_mask * restrict_mask.unsqueeze(0).to(gate_mask.dtype)
         if drop_rule_idx is not None:
             gate_mask[:, drop_rule_idx] = 0.0
-
-        gated_activations = rule_activations * gate_mask
-
+    
+        gated_activations = rule_activations * gate_mask                          # [B, R]
+    
+        # Optional pruning
         if prune_below is not None:
             keep = (gated_activations.abs() >= prune_below).float()
             gated_activations = gated_activations * keep
             gate_mask = gate_mask * keep
-
+    
+        # Residual/projection and normalization
         proj_contrib = self.proj(facts) if not isinstance(self.proj, nn.Identity) else facts
         pre_sum = gated_activations if explain_exclude_proj else (proj_contrib + gated_activations)
         output = pre_sum if explain_disable_norm else self.norm(pre_sum)
-
+    
         if return_details:
-                with torch.no_grad():
-                	_, topk_fact_idx = torch.topk(mask, k=min(self.top_k_facts, self.input_dim), dim=1)
+            with torch.no_grad():
+                _, topk_fact_idx = torch.topk(mask, k=min(self.top_k_facts, self.input_dim), dim=1)  # [R, k]
+    
             details = {
                 "pre_rule_activations": rule_activations.detach(),
                 "gated_activations": gated_activations.detach(),
@@ -105,4 +112,5 @@ class SoftFactRuleLayer(nn.Module):
                 "proj_contrib": proj_contrib.detach(),
             }
             return output, details
+    
         return output
