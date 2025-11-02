@@ -11,6 +11,7 @@ from .rules.blocks import SimpleNousBlock
 from .rules.softmax import SoftmaxRuleLayer
 from .rules.sparse import SparseRuleLayer
 from .rules import SoftFactRuleLayer
+from .rules.gaters import make_rule_gater
 
 class NousNet(nn.Module):
     """
@@ -30,6 +31,9 @@ class NousNet(nn.Module):
         l0_lambda: float = 1e-3,
         hc_temperature: float = 0.1,
         custom_calibrators: Optional[nn.ModuleList] = None,
+        # Differentiable rule gating for 'soft_fact' layers (optional)
+        rule_gater_name: Optional[str] = None,
+        rule_gater_kwargs: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
         self.config = {
@@ -38,7 +42,8 @@ class NousNet(nn.Module):
             'num_facts': num_facts, 'rules_per_layer': tuple(rules_per_layer),
             'use_calibrators': use_calibrators, 'rule_selection_method': rule_selection_method,
             'use_prototypes': bool(use_prototypes and task_type == "classification"),
-            'l0_lambda': l0_lambda, 'hc_temperature': hc_temperature
+            'l0_lambda': l0_lambda, 'hc_temperature': hc_temperature,
+            'rule_gater_name': rule_gater_name, 'rule_gater_kwargs': (rule_gater_kwargs or {})
         }
         if custom_calibrators is not None:
             self.calibrators = custom_calibrators
@@ -58,7 +63,14 @@ class NousNet(nn.Module):
             elif rule_selection_method == 'sparse':
                 blocks.append(SparseRuleLayer(cur, r, l0_lambda=l0_lambda, hc_temperature=hc_temperature))
             elif rule_selection_method == 'soft_fact':
-                blocks.append(SoftFactRuleLayer(cur, r))
+                # Optional differentiable rule gater per layer (backward compatible)
+                gater = None
+                if self.config['rule_gater_name'] is not None and len(str(self.config['rule_gater_name'])) > 0:
+                    try:
+                        gater = make_rule_gater(str(self.config['rule_gater_name']), R=r, **(self.config['rule_gater_kwargs'] or {}))
+                    except Exception:
+                        gater = None
+                blocks.append(SoftFactRuleLayer(cur, r, rule_gater=gater))
             else:
                 raise ValueError(f"Unknown rule_selection_method: {rule_selection_method}")
             cur = r
@@ -163,13 +175,27 @@ class NousNet(nn.Module):
             return np.array([pred]), np.array([pred]), internals
 
     def compute_total_l0_loss(self) -> torch.Tensor:
-        if self.config['rule_selection_method'] != 'sparse':
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        total_l0 = 0.0
+        """
+        Aggregate model-wise sparsity penalties:
+          - L0 loss from SparseRuleLayer (if any),
+          - Extra gate regularizers (e.g., Hard-Concrete budget) if present.
+        """
+        device = next(self.parameters()).device
+        total = torch.tensor(0.0, device=device)
+        # 1) L0 (only for 'sparse' layers)
+        if self.config['rule_selection_method'] == 'sparse':
+            for blk in self.blocks:
+                if hasattr(blk, 'compute_l0_loss'):
+                    total = total + blk.compute_l0_loss()
+        # 2) Gate extra losses (optional)
         for blk in self.blocks:
-            if hasattr(blk, 'compute_l0_loss'):
-                total_l0 += blk.compute_l0_loss()
-        return total_l0
+            gater = getattr(blk, 'rule_gater', None)
+            if gater is not None and hasattr(gater, 'extra_loss'):
+                try:
+                    total = total + gater.extra_loss()
+                except Exception:
+                    pass
+        return total
 
     def model_summary(self) -> Dict[str, object]:
         summary = {

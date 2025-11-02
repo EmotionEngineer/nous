@@ -3,6 +3,15 @@ from .model import NousNet
 from .facts import BetaFactLayer, PiecewiseLinearCalibrator, PiecewiseLinearCalibratorQuantile
 from .prototypes import ScaledPrototypeLayer
 from .rules import FixedPairRuleLayer, SoftmaxRuleLayer, SparseRuleLayer, SoftFactRuleLayer, SimpleNousBlock
+from .rules import (
+    BaseRuleGater,
+    GateSoftRank,
+    GateLogisticThresholdExactK,
+    GateCappedSimplex,
+    GateSparsemaxK,
+    GateHardConcreteBudget,
+    make_rule_gater,
+)
 
 # Explainability (core API)
 from .explain import (
@@ -65,6 +74,14 @@ __all__ = [
     "SparseRuleLayer",
     "SoftFactRuleLayer",
     "SimpleNousBlock",
+    # Differentiable rule gaters
+    "BaseRuleGater",
+    "GateSoftRank",
+    "GateLogisticThresholdExactK",
+    "GateCappedSimplex",
+    "GateSparsemaxK",
+    "GateHardConcreteBudget",
+    "make_rule_gater",
     # Explainability (core)
     "rule_impact_df",
     "minimal_sufficient_explanation",
