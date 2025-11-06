@@ -204,3 +204,9 @@ def make_rule_gater(name: str, R: int, **kwargs: Dict) -> BaseRuleGater:
                                       mu_budget=kwargs.get("mu_budget", 1e-2),
                                       target_k=kwargs.get("target_k", kwargs.get("k", 8)))
     raise ValueError(f"Unknown rule gater: {name}")
+
+def is_gate_param(name: str) -> bool:
+    """
+    Check if a parameter name corresponds to a gate parameter in rule layers.
+    """
+    return ("fact_logits" in name) or ("aggregator_logits" in name) or ("rule_strength_raw" in name)
