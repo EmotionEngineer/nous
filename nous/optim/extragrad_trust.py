@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 import numpy as np
 from typing import Dict, Iterable, Optional, Tuple
-
 from .base import BaseOptimizer
 from .mirror_radam import MirrorRAdam
 from ..model import NousNet
@@ -23,10 +22,8 @@ def budget_push_direction(P: torch.Tensor, k_target: int, lam: float = 1e-3) -> 
 
 class ExtragradRAdamTrust(MirrorRAdam):
     """Extragradient RAdam optimizer with KL trust region for gate parameters.
-    
     Combines extragradient steps with KL trust region constraints for stable
     optimization of rule selection gates.
-    
     Args:
         params: Iterable of parameters to optimize
         model: The model being optimized (required for parameter categorization)
@@ -41,7 +38,6 @@ class ExtragradRAdamTrust(MirrorRAdam):
         k_target: Target number of active rules (default: 8)
         eta_pred: Prediction step size for extragradient (default: 5e-3)
     """
-    
     def __init__(
         self,
         params: Iterable[torch.nn.parameter.Parameter],
@@ -63,22 +59,21 @@ class ExtragradRAdamTrust(MirrorRAdam):
         self.lam_budget = lam_budget
         self.k_target = k_target
         self.eta_pred = eta_pred
-    
+
     def step(self, closure=None, model: Optional[NousNet] = None):
         """Performs a single optimization step with extragradient and trust region."""
         loss = None
         if closure is not None:
             loss = closure()
-        
         if model is None:
             model = self.model
-        
+
         # First, save current gate parameter values
         saved_gate_params = {}
         for name, p in model.named_parameters():
             if p.requires_grad and self._is_gate_param(name) and p.grad is not None and any(p is param for param in self.gate_params):
                 saved_gate_params[name] = p.data.clone()
-        
+
         # First pass: prediction step for extragradient
         for name, p in model.named_parameters():
             if p.requires_grad and self._is_gate_param(name) and p.grad is not None and any(p is param for param in self.gate_params):
@@ -91,50 +86,51 @@ class ExtragradRAdamTrust(MirrorRAdam):
                     p.data.copy_(logits_tilde)
                 else:
                     p.data.add_(-self.eta_pred * p.grad)
-        
+
         # Second pass: compute gradients at predicted point
         if closure is not None:
             closure()
-        
+
         # Restore original gate parameters
         for name, p in model.named_parameters():
             if name in saved_gate_params and any(p is param for param in self.gate_params):
                 p.data.copy_(saved_gate_params[name])
-        
+
         # Now perform the actual update with trust region constraints
         super().step(closure)
-        
+
         # Apply KL trust region constraints to gate parameters
-        beta1, beta2 = self.defaults['betas']
-        eps = self.defaults['eps']
-        lr_gate = self.defaults['lr_gate']
-        
+        # betas/eps from group0; lr_gate comes from defaults (gate params aren’t in param_groups)
+        group0 = self.param_groups[0] if self.param_groups else {}
+        beta1, beta2 = group0.get('betas', (0.9, 0.999))
+        eps = group0.get('eps', 1e-8)
+        lr_gate = self.defaults.get('lr_gate', group0.get('lr', 1e-2))
+
         for name, p in model.named_parameters():
             if p.grad is None or not any(p is param for param in self.gate_params) or not self._is_gate_param(name):
                 continue
-            
-            if name not in self.state:
-                self.state[name] = {}
-                self.state[name]['step'] = 0
-                self.state[name]['exp_avg'] = torch.zeros_like(p.data)
-                self.state[name]['exp_avg_sq'] = torch.zeros_like(p.data)
-            
-            state = self.state[name]
+
+            # Optimizer state keyed by parameter tensor
+            state = self.state[p]
+            if len(state) == 0:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p.data)
+                state['exp_avg_sq'] = torch.zeros_like(p.data)
             state['step'] += 1
             step = state['step']
             grad = p.grad.data
-            
+
             # Update moving averages
             exp_avg = state['exp_avg']
             exp_avg_sq = state['exp_avg_sq']
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-            
+
             # Bias correction
             bias_correction1 = 1 - beta1 ** step
             bias_correction2 = 1 - beta2 ** step
             rt, rectified = self._radam_rectifier(step, beta2)
-            
+
             # Compute step
             if rectified:
                 step_size = lr_gate * rt * np.sqrt(bias_correction2) / bias_correction1
@@ -144,26 +140,23 @@ class ExtragradRAdamTrust(MirrorRAdam):
                 step_size = lr_gate / bias_correction1
                 denom = (exp_avg_sq.sqrt() / np.sqrt(bias_correction2)).add_(eps)
                 step_vec = (exp_avg / denom) * step_size
-            
+
             # Apply trust region constraints
             if p.dim() == 2:
                 P_old = F.softmax(p.data, dim=1)
                 # Add budget correction
                 step_vec = step_vec + budget_push_direction(P_old, k_target=self.k_target, lam=self.lam_budget)
-                
                 # Apply backtracking line search with KL constraint
                 alpha = 1.0
                 while alpha > 1e-4:
                     P_new = P_old * torch.exp(-alpha * step_vec)
                     P_new = P_new / (P_new.sum(dim=1, keepdim=True) + 1e-8)
                     kl = row_kl_div(P_new, P_old)
-                    
                     if torch.all(kl <= self.delta_kl):
                         logits_new = torch.log(torch.clamp(P_new, 1e-8, 1.0))
                         logits_new -= logits_new.mean(dim=1, keepdim=True)
                         p.data.copy_(logits_new)
                         break
-                    
                     alpha *= self.backtrack
                 else:
                     # If backtracking fails, use a small step
@@ -174,9 +167,9 @@ class ExtragradRAdamTrust(MirrorRAdam):
                     p.data.copy_(logits_new)
             else:
                 p.data.add_(-step_vec)
-            
+
             # Zero the gradient after update
             if p.grad is not None:
                 p.grad.zero_()
-        
+
         return loss

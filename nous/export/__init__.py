@@ -5,7 +5,7 @@ from .numpy_infer import (
     load_numpy_module,
 )
 
-all = [
+__all__ = [
     "export_numpy_inference",
     "validate_numpy_vs_torch",
     "export_and_validate",

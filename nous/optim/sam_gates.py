@@ -5,15 +5,12 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 from typing import Dict, Iterable, Optional, Tuple
 import numpy as np
-
 from .base import BaseOptimizer
 from ..model import NousNet
 
 class SharpnessAwareGates(BaseOptimizer):
     """Sharpness-Aware Minimization (SAM) optimizer for rule gate parameters.
-    
     Applies SAM perturbation only to gate logits in KL geometry (mirror step).
-    
     Args:
         params: Iterable of parameters to optimize
         model: The model being optimized (required for parameter categorization)
@@ -24,7 +21,6 @@ class SharpnessAwareGates(BaseOptimizer):
         weight_decay: Weight decay coefficient (default: 0)
         clip_grad: Maximum gradient norm for clipping (default: 0.5)
     """
-    
     def __init__(
         self,
         params: Iterable[torch.nn.parameter.Parameter],
@@ -48,7 +44,6 @@ class SharpnessAwareGates(BaseOptimizer):
             raise ValueError(f"Invalid epsilon value: {eps}")
         if clip_grad <= 0.0:
             raise ValueError(f"Invalid clip_grad value: {clip_grad}")
-        
         defaults = dict(
             lr=lr,
             rho=rho,
@@ -59,7 +54,6 @@ class SharpnessAwareGates(BaseOptimizer):
             step=0
         )
         super().__init__(params, defaults, model=model)
-        
         # Create parameter group for non-gate parameters
         self.param_groups = [
             {
@@ -71,10 +65,9 @@ class SharpnessAwareGates(BaseOptimizer):
                 'clip_grad': clip_grad
             }
         ]
-    
+
     def step(self, closure=None, model: Optional[NousNet] = None):
         """Performs a single SAM optimization step for gate parameters.
-        
         Args:
             closure: Optional closure that reevaluates the model and returns the loss
             model: The NousNet model being optimized
@@ -83,26 +76,26 @@ class SharpnessAwareGates(BaseOptimizer):
             raise ValueError("SharpnessAwareGates requires a closure")
         if model is None:
             model = self.model
-        
+
         # Step 1: Store original parameters and compute gradients
         original_params = {}
         for name, p in model.named_parameters():
             if p.requires_grad and self._is_gate_param(name) and any(p is param for param in self.gate_params):
                 original_params[name] = p.data.clone()
-        
+
         # First forward-backward pass
         loss = closure()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.defaults['clip_grad'])
-        
+        # Important: clear all grads before second backward (gate params aren’t in param_groups)
+        model.zero_grad(set_to_none=True)
+
         # Step 2: Compute SAM perturbation for gate parameters
         with torch.no_grad():
             for name, p in model.named_parameters():
                 if name not in original_params or p.grad is None:
                     continue
-                
                 rho = self.defaults['rho']
                 grad = p.grad.data
-                
                 if p.dim() != 2:
                     # For non-softmax gates
                     pv = p.data.unsqueeze(0)
@@ -120,16 +113,16 @@ class SharpnessAwareGates(BaseOptimizer):
                     logits = torch.log(torch.clamp(P_perturbed, 1e-8, 1.0))
                     logits -= logits.mean(dim=1, keepdim=True)
                     p.data.copy_(logits)
-        
-        # Step 3: Second forward-backward pass with perturbed parameters
+
+        # Step 3: Second forward-backward pass with perturbed parameters (fresh grads)
         loss = closure()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.defaults['clip_grad'])
-        
+
         # Step 4: Restore original parameters and apply update
         for name, p in model.named_parameters():
             if name in original_params and any(p is param for param in self.gate_params):
                 p.data.copy_(original_params[name])
-        
+
         # Update non-gate parameters with AdamW
         non_gate_group = self.param_groups[0]
         params = non_gate_group['params']
@@ -140,77 +133,71 @@ class SharpnessAwareGates(BaseOptimizer):
         clip_grad = non_gate_group['clip_grad']
         step = non_gate_group.get('step', 0) + 1
         non_gate_group['step'] = step
-        
+
         for p in params:
             if p.grad is None:
                 continue
-            
             grad = p.grad.data
             state = self.state[p]
-            
             # State initialization
             if len(state) == 0:
                 state['step'] = 0
                 state['exp_avg'] = torch.zeros_like(p.data)
                 state['exp_avg_sq'] = torch.zeros_like(p.data)
-            
             state['step'] += 1
             step = state['step']
-            
             exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-            
+
             # Apply weight decay
             if weight_decay != 0:
                 grad = grad.add(p.data, alpha=weight_decay)
-            
+
             # Decay the first and second moment running average coefficient
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-            
+
             # Compute bias-corrected moments
             bias_correction1 = 1 - beta1 ** step
             bias_correction2 = 1 - beta2 ** step
-            
+
             # Compute step size
             step_size = lr * np.sqrt(bias_correction2) / bias_correction1
-            
+
             # Update parameters
             denom = (exp_avg_sq.sqrt() / np.sqrt(bias_correction2)).add_(eps)
             p.data.addcdiv_(exp_avg, denom, value=-step_size)
-        
+
         # Update gate parameters with mirror descent
         rho = self.defaults['rho']
         for name, p in model.named_parameters():
             if p.grad is None or not any(p is param for param in self.gate_params) or not self._is_gate_param(name):
                 continue
-            
+
             grad = p.grad.data
-            if name not in self.state:
-                self.state[name] = {}
-                self.state[name]['step'] = 0
-                self.state[name]['exp_avg'] = torch.zeros_like(p.data)
-                self.state[name]['exp_avg_sq'] = torch.zeros_like(p.data)
-            
-            state = self.state[name]
+            # Optimizer state keyed by parameter tensor
+            state = self.state[p]
+            if len(state) == 0:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p.data)
+                state['exp_avg_sq'] = torch.zeros_like(p.data)
             state['step'] += 1
             step = state['step']
-            
             exp_avg = state['exp_avg']
             exp_avg_sq = state['exp_avg_sq']
-            
+
             # Update moving averages
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-            
+
             # Bias correction
             bias_correction1 = 1 - beta1 ** step
             bias_correction2 = 1 - beta2 ** step
-            
+
             # Compute step
-            step_size = lr / bias_correction1
+            step_size = rho / bias_correction1
             denom = (exp_avg_sq.sqrt() / np.sqrt(bias_correction2)).add_(eps)
             step_vec = (exp_avg / denom) * step_size
-            
+
             # Mirror descent step in KL geometry
             if p.dim() == 2:
                 P_old = F.softmax(p.data, dim=1)
@@ -221,9 +208,9 @@ class SharpnessAwareGates(BaseOptimizer):
                 p.data.copy_(logits_new)
             else:
                 p.data.add_(-step_vec)
-            
+
             # Zero the gradient after update
             if p.grad is not None:
                 p.grad.zero_()
-        
+
         return loss
