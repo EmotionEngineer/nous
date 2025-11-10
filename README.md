@@ -19,12 +19,12 @@
 
 ## 📦 Installation
 
-**Stable release (PyPI):**
+**Stable release (PyPI)**
 ```bash
 pip install nous
 ```
 
-**Development version (GitHub):**
+**Development version (GitHub)**
 ```bash
 pip install "nous[dev,examples] @ git+https://github.com/EmotionEngineer/nous@main"
 ```
@@ -209,12 +209,12 @@ graph TB
 
 ## 📊 Performance Benchmarks
 
-| Dataset | Metric | Nous (Modern) | XGBoost | EBM | MLP |
-|---------|--------|---------------|---------|-----|-----|
-| **HELOC** (classification) | AUC | 0.7922 ± 0.0037 | 0.7965 ± 0.0071 | 0.8001 ± 0.0065 | 0.7910 ± 0.0045 |
-| | Accuracy | 0.7199 ± 0.0063 | 0.7239 ± 0.0089 | 0.7279 ± 0.0083 | 0.7218 ± 0.0063 |
-| **California Housing** (regression) | RMSE ↓ | 0.5157 ± 0.0117 | 0.4441 ± 0.0117 | 0.5500 ± 0.0131 | 0.5231 ± 0.0072 |
-| | R² ↑ | 0.8001 ± 0.0091 | 0.8517 ± 0.0090 | 0.7726 ± 0.0107 | 0.7944 ± 0.0027 |
+| Dataset | Metric | **Nous** | **XGBoost** | **EBM** | **MLP** | **KAN** |
+|---------|--------|-------------------|-------------|---------|---------|---------|
+| **HELOC** (classification) | AUC | 0.7922 ± 0.0037 | 0.7965 ± 0.0071 | 0.8001 ± 0.0065 | 0.7910 ± 0.0045 | 0.7964 ± 0.0060 |
+| | Accuracy | 0.7199 ± 0.0063 | 0.7239 ± 0.0089 | 0.7279 ± 0.0083 | 0.7218 ± 0.0063 | 0.7252 ± 0.0073 |
+| **California Housing** (regression) | RMSE ↓ | 0.5157 ± 0.0117 | 0.4441 ± 0.0117 | 0.5500 ± 0.0131 | 0.5231 ± 0.0072 | 0.5510 ± 0.0046 |
+| | R² ↑ | 0.8001 ± 0.0091 | 0.8517 ± 0.0090 | 0.7726 ± 0.0107 | 0.7944 ± 0.0027 | 0.7719 ± 0.0038 |
 
 *Note: Nous provides state‑of‑the‑art interpretability with competitive accuracy, trading minimal performance gaps for full symbolic transparency.*
 
