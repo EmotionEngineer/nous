@@ -12,7 +12,6 @@ from .rules import (
     GateHardConcreteBudget,
     make_rule_gater,
 )
-
 # Explainability (core API)
 from .explain import (
     rule_impact_df,
@@ -29,7 +28,6 @@ from .explain import (
     AGG_NAMES,
 )
 from .explain.aggregator import format_agg_mixture
-
 # Prototype tracing utilities
 from .explain.traces import (
     describe_prototype,
@@ -39,7 +37,6 @@ from .explain.traces import (
     trace_rule_to_base_facts,
     get_last_block_static_metadata,
 )
-
 # Export utilities
 from .export import (
     export_numpy_inference,
@@ -47,7 +44,6 @@ from .export import (
     export_and_validate,
     load_numpy_module,
 )
-
 # Training and evaluation
 from .training import (
     train_model,
@@ -55,10 +51,8 @@ from .training import (
     evaluate_regression,
     make_sparse_regression_hook,
 )
-
 # Dataset helpers (used in examples)
 from .data import get_wine_data, get_california_housing_data
-
 # Utilities
 from .utils import set_global_seed, make_quantile_calibrators
 
@@ -68,6 +62,7 @@ __all__ = [
     "NousNet",
     "BetaFactLayer",
     "PiecewiseLinearCalibrator",
+    "PiecewiseLinearCalibratorQuantile",
     "ScaledPrototypeLayer",
     "FixedPairRuleLayer",
     "SoftmaxRuleLayer",
