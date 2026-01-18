@@ -12,6 +12,7 @@ from .rules import (
     GateHardConcreteBudget,
     make_rule_gater,
 )
+
 # Explainability (core API)
 from .explain import (
     rule_impact_df,
@@ -28,6 +29,7 @@ from .explain import (
     AGG_NAMES,
 )
 from .explain.aggregator import format_agg_mixture
+
 # Prototype tracing utilities
 from .explain.traces import (
     describe_prototype,
@@ -37,6 +39,7 @@ from .explain.traces import (
     trace_rule_to_base_facts,
     get_last_block_static_metadata,
 )
+
 # Export utilities
 from .export import (
     export_numpy_inference,
@@ -44,6 +47,7 @@ from .export import (
     export_and_validate,
     load_numpy_module,
 )
+
 # Training and evaluation
 from .training import (
     train_model,
@@ -51,10 +55,33 @@ from .training import (
     evaluate_regression,
     make_sparse_regression_hook,
 )
+
 # Dataset helpers (used in examples)
 from .data import get_wine_data, get_california_housing_data
+
 # Utilities
 from .utils import set_global_seed, make_quantile_calibrators
+
+# Model zoo (business-facing models)
+from .zoo import (
+    SoftLogitAND,
+    SoftLogicInteraction,
+    SegmentMoE,
+    HierarchicalMoE,
+    NousFamilies,
+)
+
+# Explainability for model zoo
+from .explain import (
+    describe_threshold_fact,
+    softlogitand_global_rules_df,
+    softlogitand_local_contrib_df,
+    moe_gate_summary_df,
+    segmentmoe_local_explain_df,
+    hiermoe_local_explain_df,
+    nousfamilies_global_summary_df,
+    nousfamilies_local_contrib_df,
+)
 
 __all__ = [
     "__version__",
@@ -114,4 +141,19 @@ __all__ = [
     # Utilities
     "set_global_seed",
     "make_quantile_calibrators",
+    # Model zoo
+    "SoftLogitAND",
+    "SoftLogicInteraction",
+    "SegmentMoE",
+    "HierarchicalMoE",
+    "NousFamilies",
+    # Explainability for model zoo
+    "describe_threshold_fact",
+    "softlogitand_global_rules_df",
+    "softlogitand_local_contrib_df",
+    "moe_gate_summary_df",
+    "segmentmoe_local_explain_df",
+    "hiermoe_local_explain_df",
+    "nousfamilies_global_summary_df",
+    "nousfamilies_local_contrib_df",
 ]

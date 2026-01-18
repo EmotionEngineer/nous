@@ -9,6 +9,18 @@ from .fidelity import explanation_fidelity_metrics
 from .stability import explanation_stability
 from .cf import suggest_rule_counterfactuals
 
+# Explainability for model zoo
+from .zoo import (
+    describe_threshold_fact,
+    softlogitand_global_rules_df,
+    softlogitand_local_contrib_df,
+    moe_gate_summary_df,
+    segmentmoe_local_explain_df,
+    hiermoe_local_explain_df,
+    nousfamilies_global_summary_df,
+    nousfamilies_local_contrib_df,
+)
+
 __all__ = [
     "AGG_NAMES",
     "aggregator_mixture_report",
@@ -23,4 +35,13 @@ __all__ = [
     "explanation_fidelity_metrics",
     "explanation_stability",
     "suggest_rule_counterfactuals",
+    # Zoo explainability
+    "describe_threshold_fact",
+    "softlogitand_global_rules_df",
+    "softlogitand_local_contrib_df",
+    "moe_gate_summary_df",
+    "segmentmoe_local_explain_df",
+    "hiermoe_local_explain_df",
+    "nousfamilies_global_summary_df",
+    "nousfamilies_local_contrib_df",
 ]
