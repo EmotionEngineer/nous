@@ -1,275 +1,318 @@
-# Nous: A Neuro‑Symbolic Library for Interpretable AI
+# Nous: A Neuro-Symbolic Library for Interpretable AI
 
-[![PyPI version](https://img.shields.io/pypi/v/nous.svg)](https://pypi.org/project/nous/)
+[![PyPI](https://img.shields.io/pypi/v/nous.svg)](https://pypi.org/project/nous/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Python ≥3.8](https://img.shields.io/badge/Python-3.8%2B-green)](https://www.python.org/)
+[![Python ≥3.10](https://img.shields.io/badge/Python-3.10%2B-green)](https://www.python.org/)
 [![PyTorch ≥2.1](https://img.shields.io/badge/PyTorch-2.1%2B-orange)](https://pytorch.org/)
-[![GitHub Repo](https://img.shields.io/badge/GitHub-Repository-808080?logo=github)](https://github.com/EmotionEngineer/nous)
 
-**Nous** (Greek: νοῦς, "mind") is a neuro‑symbolic deep learning library for building interpretable, causally transparent, and high‑performance models for classification and regression. It combines differentiable β‑facts with rule aggregation layers to produce human‑readable decision logic while retaining the benefits of gradient‑based optimization.
+**Nous** (Greek: νοῦς, "mind") is a neuro-symbolic library for **interpretable learning** in PyTorch. It provides models whose predictions flow through **facts** and **rules**, with explanations that are *honest by construction*—derived from recomputing forward passes under controlled interventions, not post-hoc gradient approximations.
 
-## 🚀 Key Features
+> **Design principle:** features → facts → rules → prediction  
+> **Explanation method:** counterfactual forward evaluation
 
-- **Human‑Readable Explanations**. Get clear "IF-THEN" rules that explain predictions
-- **Differentiable Rule Learning**. Train symbolic rules with gradient-based optimization
-- **Faithful Interpretability**. Honest leave‑one‑out, counterfactuals, and minimal sufficient explanations
-- **Zero‑Dependency Inference**. Export to pure NumPy for production deployment
-- **Prototype‑Based Reasoning**. Classification by similarity to learned prototypes
-- **Advanced Optimizers**. Specialized training for sparse, gated models
+---
 
-## 📦 Installation
+## Installation
 
-**Stable release (PyPI)**
 ```bash
 pip install nous
 ```
 
-**Development version (GitHub)**
+Optional extras:
+
 ```bash
-pip install "nous[dev,examples] @ git+https://github.com/EmotionEngineer/nous@main"
+pip install "nous[examples]"
+pip install "nous[dev]"
 ```
 
-## 🎯 Quick Start
+---
 
-### Training a Classification Model
+## Core Concepts
+
+Nous models are composed of modular, interpretable components:
+
+| Component | Description |
+|-----------|-------------|
+| **Facts** | Differentiable feature transforms (threshold facts, β-facts) mapping inputs to [0,1] |
+| **Rules** | Soft logical compositions (AND/OR/k-of-n/NOT) with learnable selection |
+| **Gating** | Sparse rule activation via hard top-k or differentiable gates |
+| **Heads** | Linear or prototype-based prediction layers |
+
+**Honest explanations** are grounded in the model's computation:
+- Drop a rule → recompute → measure prediction change
+- Freeze active rules → recompute → measure sufficiency
+- Prune activations → recompute → measure fidelity
+
+---
+
+## Quick Start
+
+**SoftLogitAND** is the recommended model for tabular tasks—balancing accuracy, stability, and interpretability.
 
 ```python
-from nous import NousNet
 import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+
+from nous import SoftLogitAND
+from nous.training import train_model
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Prepare data (SoftLogitAND expects scaled inputs)
+scaler = StandardScaler().fit(X_train)
+X_train_scaled = scaler.transform(X_train).astype("float32")
+X_val_scaled   = scaler.transform(X_val).astype("float32")
 
 # Initialize model
-model = NousNet(
-    input_dim=10,
-    num_outputs=3,
-    task_type="classification",
-    num_facts=32,
-    rules_per_layer=(16, 8),
-    rule_selection_method="soft_fact",
-    use_prototypes=True
+model = SoftLogitAND(
+    input_dim=X_train_scaled.shape[1],
+    n_rules=256,
+    n_thresh_per_feat=4,
+    tau=0.7,
+    use_negations=True,
+)
+model.init_from_data(X_train_scaled)  # thresholds from empirical quantiles
+model.to(device)
+
+# Loaders
+train_loader = DataLoader(
+    TensorDataset(
+        torch.tensor(X_train_scaled),
+        torch.tensor(y_train, dtype=torch.float32),
+    ),
+    batch_size=512,
+    shuffle=True,
+    drop_last=False,
+)
+val_loader = DataLoader(
+    TensorDataset(
+        torch.tensor(X_val_scaled),
+        torch.tensor(y_val, dtype=torch.float32),
+    ),
+    batch_size=512,
+    shuffle=False,
+    drop_last=False,
 )
 
-# Sample data
-X = torch.randn(1000, 10)
-y = torch.randint(0, 3, (1000,))
-
-# Training
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-criterion = torch.nn.CrossEntropyLoss()
-
-for epoch in range(100):
-    optimizer.zero_grad()
-    outputs = model(X)
-    loss = criterion(outputs, y)
-    loss.backward()
-    optimizer.step()
-```
-
-### Generating Explanations
-
-```python
-from nous import generate_enhanced_explanation
-
-# Explain a prediction
-x_sample = X[0].numpy()
-explanation = generate_enhanced_explanation(
-    model, x_sample, y_true=int(y[0].item()),
-    feature_names=[f"f{i}" for i in range(10)],
-    class_names=["A", "B", "C"]
+# Train
+best_val = train_model(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion=nn.BCEWithLogitsLoss(),
+    optimizer=torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4),
+    epochs=300,
+    patience=30,
+    device=device,
+    clip_grad_max_norm=1.0,
+    zero_grad_set_to_none=True,
+    loss_average="sample",
+    print_l0=False,
 )
-
-print(explanation)
+print("best val loss:", best_val)
 ```
 
-### Export for Production
+---
 
-```python
-from nous.export import export_numpy_inference, load_numpy_module
-
-# Export to pure NumPy
-export_numpy_inference(model, "nous_infer.py")
-
-# Load and use in any environment
-infer = load_numpy_module("nous_infer.py")
-probs = infer.predict(X.numpy()[:5])
-```
-
-## 🏗️ Core Architecture
+### SoftLogitAND (single-rule computation)
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#e8f4f8','primaryTextColor':'#1a1a1a','primaryBorderColor':'#2c5f7c','lineColor':'#4a90a4','secondaryColor':'#fef5e7','tertiaryColor':'#f0f8ff','noteTextColor':'#1a1a1a','noteBkgColor':'#fffacd','textColor':'#1a1a1a'}}}%%
+flowchart TB
+  subgraph Inputs
+    f["Facts: f in [0,1]^F0"]
+  end
 
-graph TB
-    %% Input Layer
-    INPUT["<b>📥 Input Layer</b><br/>x ∈ ℝᴰ<br/><i>Raw Features</i>"]:::inputStyle
-    
-    %% Preprocessing
-    CALIB["<b>📊 Feature Calibrators</b><br/>Monotonic splines<br/>Feature scaling & normalization<br/><i>Optional preprocessing</i>"]:::preprocessStyle
-    
-    %% Beta Facts
-    BETA["<b>🔷 Beta-Fact Layer</b><br/>βᵢ(x) = σ(kᵢ·(Lᵢx − Rᵢx − θᵢ))^νᵢ<br/>━━━━━━━━━━━━━━<br/>• k: sharpness parameter<br/>• ν: shape exponent<br/>• L,R: feature projections<br/>• θ: threshold bias<br/><i>N differentiable atoms ∈ [0,1]</i>"]:::factStyle
-    
-    %% Rule Layer 1
-    RULE1["<b>⚙️ Rule Layer 1</b><br/>Combinator Logic<br/>━━━━━━━━━━━━━━<br/>• AND: ∏ᵢ βᵢ<br/>• OR: 1−∏ᵢ(1−βᵢ)<br/>• k-of-n: soft threshold<br/>• NOT: 1−β<br/><i>R₁ learned rules</i>"]:::ruleStyle
-    
-    GATE1["<b>🚪 Gating 1</b><br/>Soft top-k selection<br/>Budget masking<br/><i>Sparsity control</i>"]:::gateStyle
-    
-    AGG1["<b>∑ Aggregation 1</b><br/>Weighted sum<br/>Residual connections"]:::aggStyle
-    
-    %% Rule Layer 2
-    RULE2["<b>⚙️ Rule Layer 2</b><br/>Higher-order combinations<br/>━━━━━━━━━━━━━━<br/>Rules over rules<br/><i>R₂ meta-rules</i>"]:::ruleStyle
-    
-    GATE2["<b>🚪 Gating 2</b><br/>Hierarchical pruning<br/>Confidence weighting"]:::gateStyle
-    
-    AGG2["<b>∑ Aggregation 2</b><br/>Final rule scores<br/>Symbolic → numeric"]:::aggStyle
-    
-    %% Output Heads
-    HEAD_LINEAR["<b>📐 Linear Head</b><br/>W·r + b<br/><i>Regression output</i>"]:::headStyle
-    
-    HEAD_PROTO["<b>🎯 Prototype Head</b><br/>Similarity to prototypes<br/>━━━━━━━━━━━━━━<br/>d(r, pₖ) = ||r − pₖ||₂<br/>L2 normalization<br/><i>Classification via distance</i>"]:::headStyle
-    
-    %% Output
-    OUTPUT["<b>📤 Predictions</b><br/>ŷ ∈ ℝᴷ<br/>━━━━━━━━━━━━━━<br/>• Logits (classification)<br/>• Values (regression)<br/>+ Rule activations<br/>+ Explanation data"]:::outputStyle
-    
-    %% Explanation Module
-    EXPLAIN["<b>💡 Explanation Engine</b><br/>━━━━━━━━━━━━━━<br/>• IF-THEN rules<br/>• Counterfactuals<br/>• Feature importance<br/>• Minimal sufficient sets<br/>• Global rule ranking"]:::explainStyle
-    
-    %% Connections
-    INPUT --> CALIB
-    CALIB --> BETA
-    BETA --> RULE1
-    RULE1 --> GATE1
-    GATE1 --> AGG1
-    AGG1 --> RULE2
-    RULE2 --> GATE2
-    GATE2 --> AGG2
-    
-    AGG2 --> HEAD_LINEAR
-    AGG2 --> HEAD_PROTO
-    
-    HEAD_LINEAR --> OUTPUT
-    HEAD_PROTO --> OUTPUT
-    
-    OUTPUT -.->|"Rule traces"| EXPLAIN
-    RULE1 -.->|"Layer 1 rules"| EXPLAIN
-    RULE2 -.->|"Layer 2 rules"| EXPLAIN
-    BETA -.->|"Fact activations"| EXPLAIN
-    
-    %% Subgraphs
-    subgraph SYMBOLIC ["<b>🧠 Symbolic Core</b>"]
-        BETA
-        RULE1
-        RULE2
-    end
-    
-    subgraph CONTROL ["<b>🎛️ Neural Control</b>"]
-        GATE1
-        GATE2
-        AGG1
-        AGG2
-    end
-    
-    subgraph HEADS ["<b>🎯 Task Heads</b>"]
-        HEAD_LINEAR
-        HEAD_PROTO
-    end
-    
-    %% Gradient Flow Annotation
-    GRAD["<b>⚡ Gradient Flow</b><br/>End-to-end differentiable<br/>Backprop through rules"]:::gradStyle
-    OUTPUT -.->|"∇Loss"| GRAD
-    GRAD -.->|"∂L/∂β, ∂L/∂W"| BETA
-    
-    %% Styling
-    classDef inputStyle fill:#e3f2fd,stroke:#1976d2,stroke-width:3px,color:#0d47a1,font-weight:bold
-    classDef preprocessStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#4a148c
-    classDef factStyle fill:#fff3e0,stroke:#e65100,stroke-width:3px,color:#bf360c,font-weight:bold
-    classDef ruleStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1b5e20,font-weight:bold
-    classDef gateStyle fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#880e4f
-    classDef aggStyle fill:#e0f2f1,stroke:#00695c,stroke-width:2px,color:#004d40
-    classDef headStyle fill:#f1f8e9,stroke:#558b2f,stroke-width:3px,color:#33691e,font-weight:bold
-    classDef outputStyle fill:#e8eaf6,stroke:#283593,stroke-width:4px,color:#1a237e,font-weight:bold
-    classDef explainStyle fill:#fffde7,stroke:#f9a825,stroke-width:3px,color:#f57f17,font-weight:bold
-    classDef gradStyle fill:#fce4ec,stroke:#ad1457,stroke-width:2px,color:#880e4f,font-style:italic
-    
-    style SYMBOLIC fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,stroke-dasharray: 5 5
-    style CONTROL fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,stroke-dasharray: 5 5
-    style HEADS fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,stroke-dasharray: 5 5
+  f --> aug["Literals: L = [f, 1-f]<br/>(if use_negations)"]
+
+  subgraph Rule_r["Rule r"]
+    sel["Selector logits: sel_logits_r"]
+    p["p_r = softmax(sel_logits_r / tau)"]
+    bias["Bias: b_r"]
+  end
+
+  sel --> p
+  aug --> logitL["logit(L)"]
+  logitL --> dot["score_r = logit(L) * p_r - b_r"]
+  p --> dot
+  bias --> dot
+  dot --> z["z_r = sigmoid(score_r)"]
 ```
 
-### Key Components
+---
 
-- **β‑Facts**. Differentiable, bounded atoms defined as:
-  `βᵢ(x) = σ(kᵢ · (Lᵢx − Rᵢx − θᵢ))^νᵢ`
-  where `k` controls sharpness, `ν` controls shape, and `(L, R, θ)` parameterize linear predicates
+## Explanation API
 
-- **Rule Layers**. Combinators over β‑facts using AND/OR/k‑of‑n/NOT with multiple selection modes
+### Local explanations with cluster themes (SoftLogitAND)
 
-- **Differentiable Gaters**. Soft top‑k or budgeted masking over rules
-
-- **Prototype Head**. Classification by similarity to learned, L2‑normalized prototypes
-
-## 📊 Performance Benchmarks
-
-| Dataset | Metric | **Nous** | **XGBoost** | **EBM** | **MLP** | **KAN** |
-|---------|--------|----------|-------------|---------|---------|---------|
-| **HELOC** (classification) | AUC | 0.7922 ± 0.0037 | 0.7965 ± 0.0071 | 0.8001 ± 0.0065 | 0.7910 ± 0.0045 | 0.7964 ± 0.0060 |
-| | Accuracy | 0.7199 ± 0.0063 | 0.7239 ± 0.0089 | 0.7279 ± 0.0083 | 0.7218 ± 0.0063 | 0.7252 ± 0.0073 |
-| **California Housing** (regression) | RMSE ↓ | 0.5157 ± 0.0117 | 0.4441 ± 0.0117 | 0.5500 ± 0.0131 | 0.5231 ± 0.0072 | 0.5510 ± 0.0046 |
-| | R² ↑ | 0.8001 ± 0.0091 | 0.8517 ± 0.0090 | 0.7726 ± 0.0107 | 0.7944 ± 0.0027 | 0.7719 ± 0.0038 |
-
-*Note: Nous provides state‑of‑the‑art interpretability with competitive accuracy, trading minimal performance gaps for full symbolic transparency.*
-
-## 🔍 Advanced Features
-
-### Minimal Sufficient Explanations
 ```python
-from nous.explain import minimal_sufficient_explanation
+from nous import SoftLogitANDPosthocExplainer
 
-mse = minimal_sufficient_explanation(model, x_sample)
-print(f"Minimal rules needed: {mse['rules_used']}")
+explainer = SoftLogitANDPosthocExplainer(
+    model=model,
+    feature_names=feature_names,
+    x_scaler=scaler,   # required if you pass raw (unscaled) x to report()
+    k_rules=10,
+    n_clusters=16,
+)
+
+explainer.fit_posthoc(X_ref_scaled=X_train_scaled)
+
+report = explainer.report(x_raw, y_true01=float(y_true), x_is_scaled=False)
+print(report.markdown)                  # Human-readable explanation
+df = report.tables["cluster_themes"]    # Structured rule clusters (DataFrame)
 ```
 
-### Counterfactual Suggestions
+### Intervention-based analysis (NousNet)
+
 ```python
-from nous.explain import suggest_rule_counterfactuals
+from nous import rule_impact_df, minimal_sufficient_explanation, suggest_rule_counterfactuals
 
-cf = suggest_rule_counterfactuals(model, x_sample, target_class=1)
-print(f"Change {cf['feature']} from {cf['current']} to {cf['target']}")
+impacts = rule_impact_df(model, x, feature_names)
+mse = minimal_sufficient_explanation(model, x, feature_names)
+cfs = suggest_rule_counterfactuals(model, x, feature_names, target="flip")
 ```
 
-### Global Rule Analysis
+---
+
+## Model Zoo
+
+| Model | Description |
+|-------|-------------|
+| **SoftLogitAND** | Threshold facts + logit-AND rules (recommended baseline) |
+| **SoftLogicInteraction** | Low-rank interaction facts before logit-AND rules |
+| **SegmentMoE** | Mixture-of-experts with soft-logic gating |
+| **HierarchicalMoE** | SegmentMoE gating with SoftLogitAND experts |
+| **NousFamilies** | Rule aggregation into stable families for governance |
+
+---
+
+## Export (NousNet → NumPy)
+
+Export is currently implemented for **`NousNet`** models (including `soft_fact` layers and rule gaters), producing a self-contained NumPy inference module and validating parity vs PyTorch.
+
 ```python
-from nous.explain import global_rulebook
+import numpy as np
+from nous import NousNet
+from nous.export import export_numpy_inference, load_numpy_module, validate_numpy_vs_torch
 
-rules = global_rulebook(model, X.numpy())
-print(f"Top global rule: {rules[0]['description']}")
+model = NousNet(
+    input_dim=8,
+    num_outputs=3,
+    task_type="classification",
+    num_facts=12,
+    rules_per_layer=(8,),
+    rule_selection_method="soft_fact",
+    use_calibrators=False,
+)
+
+X = np.random.randn(64, 8).astype(np.float32)
+
+export_numpy_inference(model, file_path="infer.py")
+npmod = load_numpy_module("infer.py")
+
+report = validate_numpy_vs_torch(model, npmod, X, task="classification", n=32)
+print(report)
 ```
 
-## 🗂️ Project Structure
+---
 
+## Example Results (synthetic + sanity checks)
+
+Nous does not yet ship a full benchmark suite. For transparency, we report an illustrative experiment from
+`examples/softlogit_synthetic.py`: a controlled synthetic binary classification task with **hidden ground‑truth rules**
+and **correlated decoy features** (to stress interpretability).
+
+### Predictive metrics (vs common baselines)
+
+Below is a representative run comparing SoftLogitAND against strong baselines (EBM and XGBoost).
+This is *not* a general benchmark claim; it is provided as an internal validation and demonstration of the workflow.
+
+| model        | split | auc      | acc      | logloss   |
+|-------------|-------|----------|----------|-----------|
+| EBM         | test  | 0.678388 | 0.621167 | 0.627355  |
+| XGBoost     | test  | 0.674476 | 0.628000 | 0.625940  |
+| SoftLogitAND| test  | 0.673156 | 0.630167 | 0.628430  |
+| XGBoost     | train | 0.837673 | 0.750381 | 0.565467  |
+| EBM         | train | 0.750905 | 0.683286 | 0.590412  |
+| SoftLogitAND| train | 0.708272 | 0.649571 | 0.608605  |
+| SoftLogitAND| val   | 0.693072 | 0.648667 | 0.617313  |
+| EBM         | val   | 0.692212 | 0.639667 | 0.621746  |
+| XGBoost     | val   | 0.689324 | 0.644333 | 0.620255  |
+
+**Interpretation.** On this task, SoftLogitAND is competitive with strong baselines on test performance while providing
+a strictly rule‑based structure and direct intervention-based explanations. For this reason, SoftLogitAND is the
+recommended default model in Nous when you want a strong accuracy/interpretability trade-off.
+
+### Logic sanity check: ground-truth rules firing for a sample
+
+Since the dataset is generated by known rules, we can verify which ground‑truth rules are satisfied for any input `x`.
+Example output for one sample:
+
+| truth_rule | weight | conds |
+|---|---|---|
+| R1_pos | 2.4 | [(3, '>', 0.7), (17, '<=', -0.2)] |
+| R2_pos | 2.0 | [(55, '>', 0.0), (120, '<=', 0.0), (7, '>', 0.0)] |
+| R3_neg | -2.0 | [(10, '<=', -1.2), (11, '<=', -0.8)] |
+| R4_pos | 1.2 | [(80, '>', 0.3), (81, '>', 0.3)] |
+
+This check is useful when interpreting local rule explanations: it clarifies whether the underlying “true” mechanism is active.
+
+### Feature recovery @K (global importance vs ground truth)
+
+Because the generating rules depend on a small set of true features, we can measure how well global importance
+recovers the ground-truth feature set.
+
+For SoftLogitAND we use:
+`expl.global_feature_importance_mass_weighted(split="train")`.
+
+Representative results:
+
+- **K=10**
+  - SoftLogitAND: precision@K=0.90, recall@K=1.00, jaccard=0.90
+  - EBM (fixed):  precision@K=0.80, recall@K=0.889, jaccard=0.727
+  - XGBoost:      precision@K=0.90, recall@K=1.00, jaccard=0.90
+
+- **K=20**
+  - SoftLogitAND: precision@K=0.45, recall@K=1.00, jaccard=0.45
+  - EBM (fixed):  precision@K=0.45, recall@K=1.00, jaccard=0.45
+  - XGBoost:      precision@K=0.45, recall@K=1.00, jaccard=0.45
+
+- **K=40**
+  - SoftLogitAND: precision@K=0.30, recall@K=1.00, jaccard=0.30
+  - EBM (fixed):  precision@K=0.225, recall@K=1.00, jaccard=0.225
+  - XGBoost:      precision@K=0.225, recall@K=1.00, jaccard=0.225
+
+### Counterfactual test (truth-rule ON vs OFF) on SoftLogitAND
+
+A particularly strong sanity check is counterfactual manipulation: we force each ground-truth rule to be satisfied (ON)
+or violated (OFF) by moving only the features involved in that rule, then measure the change in the model’s predicted probability.
+
+Mean effect (forcing rule ON vs OFF) for the trained SoftLogitAND model:
+
+| rule  | truth_weight | mean Δprob (ON − OFF) |
+|-------|-------------:|-----------------------:|
+| R1_pos| +2.4         | +0.366704 |
+| R2_pos| +2.0         | +0.323780 |
+| R3_neg| −2.0         | −0.204971 |
+| R4_pos| +1.2         | +0.232676 |
+
+**Interpretation.** The sign and relative magnitude of the counterfactual effects align with the generating rule weights,
+supporting the claim that SoftLogitAND learns a meaningful rule-level causal structure on this synthetic task.
+
+---
+
+## Citation
+
+```bibtex
+@software{tlupov2025nous,
+  author = {Tlupov, Islam},
+  title = {Nous: A Neuro-Symbolic Library for Interpretable AI},
+  url = {https://github.com/EmotionEngineer/nous},
+  year = {2025}
+}
 ```
-nous/
-├── model.py              # Main NousNet class
-├── facts.py              # β-facts and calibrators
-├── rules/                # Rule layers and gaters
-├── prototypes.py         # Prototype-based head
-├── explain/              # Interpretation tools
-├── export/               # NumPy export
-├── training/             # Training utilities
-├── optim/                # Specialized optimizers
-└── examples/             # Usage examples
-```
 
-## 🤝 Contributing
-
-We welcome contributions! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feat/amazing-feature`)
-3. Add tests and documentation
-4. Open a pull request
-
-Bug reports, documentation improvements, and use‑case suggestions are appreciated.
-
-## 📄 License
-
-MIT License. See [LICENSE](https://github.com/EmotionEngineer/nous/blob/main/LICENSE) for details.
+**License:** MIT
