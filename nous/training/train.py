@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 import inspect
 from typing import Callable, Optional, Dict
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
 
 def train_model(
     model: nn.Module,
@@ -21,11 +23,32 @@ def train_model(
     log_every: int = 10,
     use_tqdm: bool = False,
     print_l0: bool = True,
+    # NEW: training behavior controls (to match notebook loops)
+    clip_grad_max_norm: float | None = 0.5,
+    zero_grad_set_to_none: bool = False,
+    loss_average: str = "batch",  # "batch" (legacy) | "sample" (notebook-style)
 ) -> float:
     """
-    Train with early stopping. Adds L0 loss (if model exposes compute_total_l0_loss) and gradient clipping.
+    Train with early stopping. Adds L0 loss (if model exposes compute_total_l0_loss) and optional gradient clipping.
+
+    Key behavior options
+    --------------------
+    clip_grad_max_norm:
+        If not None, applies nn.utils.clip_grad_norm_ with this max norm.
+        Default remains 0.5 for backward compatibility with earlier Nous behavior.
+        To match your notebook loop, use clip_grad_max_norm=1.0.
+
+    zero_grad_set_to_none:
+        If True, calls optimizer.zero_grad(set_to_none=True) (notebook-style).
+        Default False for backward compatibility.
+
+    loss_average:
+        - "batch": averages train/val loss by number of batches (legacy behavior).
+        - "sample": averages train/val loss by number of samples (notebook-style).
+        This affects early stopping selection and logging, not gradients (criterion still returns mean loss).
 
     Progress
+    --------
     - verbose >= 1 prints epoch-level logs every `log_every` epochs, on improvement, and on first/last epoch.
     - use_tqdm shows a progress bar over epochs with train/val (and L0) in the postfix.
     - after_epoch_hook can be:
@@ -34,8 +57,11 @@ def train_model(
       where metrics_dict contains:
         {epoch, train_loss, val_loss, l0_loss, improved}.
     """
+    if loss_average not in ("batch", "sample"):
+        raise ValueError("loss_average must be 'batch' or 'sample'")
+
     model.to(device)
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
     epochs_no_improve = 0
     best_model_state = None
 
@@ -54,40 +80,60 @@ def train_model(
         # Train
         # -------------------------
         model.train()
-        total_train_loss = 0.0
+        total_train_loss_sum = 0.0
+        total_train_weight = 0.0
+
         total_l0_loss = 0.0
         steps = 0
 
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
+
+            # zero_grad (optionally set_to_none)
+            try:
+                optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
+            except TypeError:
+                optimizer.zero_grad()
 
             outputs = model(X_batch)
             if isinstance(criterion, nn.CrossEntropyLoss) or (outputs.ndim == 2 and outputs.size(-1) > 1):
                 target = y_batch.long()    # classification
             else:
-                target = y_batch.float()   # regression
+                target = y_batch.float()   # regression / BCE-logits
             loss = criterion(outputs, target)
 
             l0_loss = getattr(model, "compute_total_l0_loss", lambda: torch.tensor(0.0, device=device))()
             total_loss = loss + l0_loss
 
             total_loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
+            if clip_grad_max_norm is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_grad_max_norm))
+
             optimizer.step()
 
-            total_train_loss += float(loss.item())
+            # Bookkeeping: average loss either by batches or by samples
+            bs = int(X_batch.shape[0])
+            if loss_average == "sample":
+                total_train_loss_sum += float(loss.item()) * bs
+                total_train_weight += bs
+            else:
+                total_train_loss_sum += float(loss.item())
+                total_train_weight += 1.0
+
             total_l0_loss += float(l0_loss.item()) if isinstance(l0_loss, torch.Tensor) else float(l0_loss)
             steps += 1
 
-        avg_train_loss = total_train_loss / max(1, steps)
+        avg_train_loss = total_train_loss_sum / max(1.0, total_train_weight)
         avg_l0_loss = total_l0_loss / max(1, steps)
 
         # -------------------------
         # Validate
         # -------------------------
         model.eval()
-        total_val_loss = 0.0
+        total_val_loss_sum = 0.0
+        total_val_weight = 0.0
+
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
@@ -96,9 +142,18 @@ def train_model(
                     target = y_batch.long()
                 else:
                     target = y_batch.float()
+
                 vloss = criterion(outputs, target)
-                total_val_loss += float(vloss.item())
-        avg_val_loss = total_val_loss / max(1, len(val_loader))
+                bs = int(X_batch.shape[0])
+
+                if loss_average == "sample":
+                    total_val_loss_sum += float(vloss.item()) * bs
+                    total_val_weight += bs
+                else:
+                    total_val_loss_sum += float(vloss.item())
+                    total_val_weight += 1.0
+
+        avg_val_loss = total_val_loss_sum / max(1.0, total_val_weight)
 
         improved = avg_val_loss < (best_val_loss - 1e-6)
 
