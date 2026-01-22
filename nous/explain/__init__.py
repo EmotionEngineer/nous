@@ -21,6 +21,15 @@ from .zoo import (
     nousfamilies_local_contrib_df,
 )
 
+# SoftLogitAND post-hoc (cluster themes + selection strategies)
+from .softlogitand_posthoc import (
+    SoftLogitANDPosthocReport,
+    SoftLogitANDPosthocExplainer,
+    mmr_select_rules,
+    hard_cap_topk_rules,
+    mmr_with_hardcap,
+)
+
 __all__ = [
     "AGG_NAMES",
     "aggregator_mixture_report",
@@ -44,4 +53,10 @@ __all__ = [
     "hiermoe_local_explain_df",
     "nousfamilies_global_summary_df",
     "nousfamilies_local_contrib_df",
+    # SoftLogitAND post-hoc
+    "SoftLogitANDPosthocReport",
+    "SoftLogitANDPosthocExplainer",
+    "mmr_select_rules",
+    "hard_cap_topk_rules",
+    "mmr_with_hardcap",
 ]

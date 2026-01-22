@@ -83,6 +83,15 @@ from .explain import (
     nousfamilies_local_contrib_df,
 )
 
+# NEW: SoftLogitAND post-hoc (cluster themes + selection strategies)
+from .explain.softlogitand_posthoc import (
+    SoftLogitANDPosthocReport,
+    SoftLogitANDPosthocExplainer,
+    mmr_select_rules,
+    hard_cap_topk_rules,
+    mmr_with_hardcap,
+)
+
 __all__ = [
     "__version__",
     # Core model and components
@@ -156,4 +165,10 @@ __all__ = [
     "hiermoe_local_explain_df",
     "nousfamilies_global_summary_df",
     "nousfamilies_local_contrib_df",
+    # NEW: SoftLogitAND post-hoc
+    "SoftLogitANDPosthocReport",
+    "SoftLogitANDPosthocExplainer",
+    "mmr_select_rules",
+    "hard_cap_topk_rules",
+    "mmr_with_hardcap",
 ]
