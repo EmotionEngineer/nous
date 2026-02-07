@@ -76,6 +76,7 @@ from .zoo_v2 import (
     MLP, BoxNet,
     IntervalFactBank, RelationalFactBank, RelationalDiffFactBank, ARFactBank, MultiResAxisFactBank,
     IntervalLogitAND, RelationalLogitAND, TemplateNet, RuleListNet, FactDiagram,
+    NALogicNet,
     CornerNet, SoftMinCornerNet, KofNCornerNet, RingCornerNet, HybridCornerIntervalNet,
     PriorityMixtureNet, EvidenceNet, MarginEvidenceNet, PerFeatureKappaEvidenceNet,
     LadderEvidenceNet, BiEvidenceNet, EvidenceKofNNet,
@@ -172,7 +173,7 @@ __all__ = [
     "SegmentMoE",
     "HierarchicalMoE",
     "NousFamilies",
-        # Model zoo v2
+    # Model zoo v2
     "MLP",
     "BoxNet",
     "IntervalFactBank",
@@ -185,6 +186,7 @@ __all__ = [
     "TemplateNet",
     "RuleListNet",
     "FactDiagram",
+    "NALogicNet",
     "CornerNet",
     "SoftMinCornerNet",
     "KofNCornerNet",
@@ -226,7 +228,7 @@ __all__ = [
     "hiermoe_local_explain_df",
     "nousfamilies_global_summary_df",
     "nousfamilies_local_contrib_df",
-    # NEW: SoftLogitAND post-hoc
+    # SoftLogitAND post-hoc
     "SoftLogitANDPosthocReport",
     "SoftLogitANDPosthocExplainer",
     "mmr_select_rules",

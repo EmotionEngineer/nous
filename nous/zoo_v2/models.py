@@ -1856,3 +1856,53 @@ class BudgetedForest(nn.Module):
         if self.output_dim == 1:
             return (probs * self.leaf_value[None, :, :]).sum(dim=2).sum(dim=1)
         return torch.einsum("btl,tlc->btc", probs, self.leaf_value).sum(dim=1)
+
+class NALogicNet(nn.Module):
+    """
+    NA-aware logic rules: threshold facts augmented with per-feature
+    missingness indicators, fed into LogitAND rules.
+
+    For inputs with NaN values, the NaN positions are replaced with 0
+    for the threshold facts, and a binary missingness mask is appended
+    as additional facts so the rules can learn to condition on missingness.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        n_rules: int = 128,
+        n_thresh_per_feat: int = 6,
+        tau: float = 0.7,
+        output_dim: int = 1,
+    ) -> None:
+        super().__init__()
+        self.output_dim = int(output_dim)
+        self.D = int(input_dim)
+
+        self.facts = ThresholdFactBank(input_dim, n_thresh_per_feat=n_thresh_per_feat)
+        F0 = self.facts.num_facts
+        self.n_facts_total = F0 + self.D
+
+        self.rules = LogitANDRuleLayer(
+            n_rules=n_rules,
+            n_facts=self.n_facts_total,
+            tau=tau,
+            use_negations=True,
+        )
+        self.head = nn.Linear(n_rules, self.output_dim)
+
+    @torch.no_grad()
+    def init_from_data(self, X: np.ndarray) -> None:
+        self.facts.init_from_data_quantiles(X)
+        nn.init.normal_(self.head.weight, std=0.01)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xnan = torch.isnan(x)
+        x0 = torch.nan_to_num(x, nan=0.0)
+        f = self.facts(x0)
+        miss = xnan.float()
+        f_all = torch.cat([f, miss], dim=1)
+        z, _ = self.rules(f_all)
+        y = self.head(z)
+        return y.squeeze(-1) if self.output_dim == 1 else y

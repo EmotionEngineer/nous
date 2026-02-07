@@ -23,6 +23,7 @@ from .models import (
     TemplateNet,
     RuleListNet,
     FactDiagram,
+    NALogicNet,
     CornerNet,
     SoftMinCornerNet,
     KofNCornerNet,
@@ -65,20 +66,21 @@ __all__ = [
     # Simple baselines
     "MLP",
     "BoxNet",
-    
+
     # Fact banks
     "IntervalFactBank",
     "RelationalFactBank",
     "RelationalDiffFactBank",
     "ARFactBank",
     "MultiResAxisFactBank",
-    
+
     # Rule-based models
     "IntervalLogitAND",
     "RelationalLogitAND",
     "TemplateNet",
     "RuleListNet",
     "FactDiagram",
+    "NALogicNet",
     "CornerNet",
     "SoftMinCornerNet",
     "KofNCornerNet",
@@ -97,7 +99,7 @@ __all__ = [
     "GroupContrastNet",
     "GroupRingNet",
     "RegimeRulesNet",
-    
+
     # Forest/router family
     "PredicateForest",
     "ObliviousForest",

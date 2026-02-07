@@ -1,9 +1,14 @@
+# nous/zoo_v2/trees.py
+"""
+Predicate-router tree used as a building block for forest and tree-of-rules models.
+"""
 from __future__ import annotations
 
 from typing import Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.init as nn_init
 
 from ..zoo import ThresholdFactBank
 from .common import safe_log, sparsemax
@@ -12,7 +17,6 @@ from .common import safe_log, sparsemax
 class PredicateRouterTree(nn.Module):
     """
     Router/diagram over threshold facts.
-
     Output:
       leaf_p: [B, L] where L = 2^depth
     """
@@ -29,7 +33,6 @@ class PredicateRouterTree(nn.Module):
         self.depth = int(depth)
         self.selector = str(selector)
         self.tau_select = float(tau_select)
-
         self.n_nodes = (2**self.depth) - 1
         self.n_leaves = 2**self.depth
 
@@ -59,17 +62,18 @@ class PredicateRouterTree(nn.Module):
     @torch.no_grad()
     def init_from_data(self, X):
         self.facts.init_from_data_quantiles(X)
-        nn = __import__("torch.nn", fromlist=["init"]).init  # avoid reimport warning
-        nn.normal_(self.sel_logits, std=0.01)
+        nn_init.normal_(self.sel_logits, std=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         f = self.facts(x)
         f_aug = torch.cat([f, 1.0 - f], dim=1)
+
         sel = self._sel(self.sel_logits)  # [N,Fin]
         t = (f_aug[:, None, :] * sel[None, :, :]).sum(dim=2).clamp(1e-6, 1 - 1e-6)
 
         term = self.leaf_used[None, :, :] * (
-            self.leaf_dir[None, :, :] * t[:, None, :] + (1.0 - self.leaf_dir[None, :, :]) * (1.0 - t[:, None, :])
+            self.leaf_dir[None, :, :] * t[:, None, :]
+            + (1.0 - self.leaf_dir[None, :, :]) * (1.0 - t[:, None, :])
         ) + (1.0 - self.leaf_used[None, :, :]) * 1.0
 
         return torch.exp(safe_log(term).sum(dim=2))  # [B,L]
