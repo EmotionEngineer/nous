@@ -1,46 +1,45 @@
 # nous/explain/zoo_v2.py
 """
 Interpretation utilities for Nous zoo_v2 models.
-Provides consistent global/local explanation APIs across model families.
+
+Goals
+-----
+- Provide consistent global + local explanation APIs across model families.
+- Render human-readable rule text with optional simplification.
+- Support unscaling thresholds via sklearn-like scalers.
+
+Notes
+-----
+These models are differentiable and often use soft selections; "global rules"
+here are approximations derived from argmax selectors / top masked features.
 """
+
 from __future__ import annotations
+
+import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn.functional as F
-from ..zoo_v2 import (
-    # Evidence family
-    EvidenceNet, MarginEvidenceNet, PerFeatureKappaEvidenceNet, BiEvidenceNet,
-    LadderEvidenceNet, EvidenceKofNNet,
-    # Group evidence family
-    GroupEvidenceKofNNet, SoftGroupEvidenceKofNNet, GroupSoftMinNet,
-    GroupContrastNet, GroupRingNet,
-    # Corner family
-    CornerNet, SoftMinCornerNet, KofNCornerNet, RingCornerNet, HybridCornerIntervalNet,
-    # Regime models
-    RegimeRulesNet,
-    # Forest family
-    PredicateForest, ObliviousForest, LeafLinearForest, AttentiveForest,
-    MultiResForest, GroupFirstForest, BudgetedForest,
-    # Rule trees
-    RuleTree, SparseRuleTree, RuleDiagram,
-    # Other models
-    TemplateNet, RuleListNet, FactDiagram, PriorityMixtureNet,
-    ClauseNet, ARLogitAND, Scorecard, ScorecardWithRules, NALogicNet,
-    IntervalLogitAND, RelationalLogitAND, BoxNet,
-    # Fact banks
-    ThresholdFactBank, IntervalFactBank, RelationalFactBank, ARFactBank,
-    MultiResAxisFactBank,
-)
-from ..zoo import ThresholdFactBank as LegacyThresholdFactBank
-from .facts_desc import render_fact_descriptions as _render_beta_facts
+
+try:
+    import pandas as pd
+except Exception as e:  # pragma: no cover
+    pd = None
+
+from ..zoo import ThresholdFactBank
+from ..zoo_v2.common import corner_product_z, safe_log, sparsemax
+from ..zoo_v2.facts import ARFactBank, IntervalFactBank, MultiResAxisFactBank
+
 
 Readability = Literal["exact", "pretty", "simplified", "clinical"]
 
+
 # ===== Feature metadata utilities =====
+
 @dataclass(frozen=True)
 class Clause:
     base: str
@@ -49,6 +48,7 @@ class Clause:
     value: Union[float, str, int]
     raw_feature: str
     feature_index: int
+
 
 @dataclass
 class SimplifiedCondition:
@@ -60,12 +60,17 @@ class SimplifiedCondition:
     allowed: Optional[List[str]] = None
     banned: Optional[List[str]] = None
 
+
 def _split_ohe(name: str) -> Optional[Tuple[str, str]]:
-    """Split OHE feature name into base feature and category value."""
+    """Split OHE feature name into base feature and category suffix.
+
+    Heuristic: "Base_Suffix" and suffix not too long.
+    """
     m = re.match(r"^(.+)_(.+)$", name)
-    if not m or len(m.group(2)) > 30:  # avoid splitting non-OHE names
+    if not m or len(m.group(2)) > 30:
         return None
     return m.group(1), m.group(2)
+
 
 def _compute_base_order(feature_names: List[str]) -> Dict[str, int]:
     """Compute canonical ordering of base features from OHE-expanded names."""
@@ -76,25 +81,42 @@ def _compute_base_order(feature_names: List[str]) -> Dict[str, int]:
         order.setdefault(base, i)
     return order
 
+
 def _feature_is_binary(Xi: np.ndarray, max_rows: int = 6000) -> np.ndarray:
-    """Detect binary features from imputed data."""
-    Xs = Xi[:max_rows]
+    """Detect binary features from (imputed) data matrix Xi."""
+    Xs = np.asarray(Xi)[:max_rows]
+    if Xs.ndim != 2:
+        raise ValueError("Xi must be [N,D]")
     is_bin = np.zeros(Xs.shape[1], dtype=bool)
     for j in range(Xs.shape[1]):
-        u = np.unique(np.round(Xs[:, j], 6))
+        col = Xs[:, j]
+        col = col[np.isfinite(col)]
+        if col.size == 0:
+            continue
+        u = np.unique(np.round(col, 6))
         if len(u) <= 2 and set(u.tolist()).issubset({0.0, 1.0}):
             is_bin[j] = True
     return is_bin
+
+
+def _is_binary_fallback_from_names(feature_names: Sequence[str]) -> np.ndarray:
+    """Fallback binary detection when no reference data is available."""
+    out = np.zeros(len(feature_names), dtype=bool)
+    for j, n in enumerate(feature_names):
+        # If it looks like OHE, treat as binary.
+        out[j] = _split_ohe(n) is not None
+    return out
+
 
 def _build_ohe_groups(feature_names: List[str], is_bin: np.ndarray) -> Dict[str, Dict[str, Any]]:
     """Group OHE features by base feature name."""
     tmp: Dict[str, List[Tuple[int, str]]] = {}
     for j, name in enumerate(feature_names):
         sp = _split_ohe(name)
-        if sp is None or not is_bin[j]:
+        if sp is None or not bool(is_bin[j]):
             continue
         tmp.setdefault(sp[0], []).append((j, sp[1]))
-    
+
     out: Dict[str, Dict[str, Any]] = {}
     for base, pairs in tmp.items():
         if len(pairs) < 2:
@@ -102,7 +124,9 @@ def _build_ohe_groups(feature_names: List[str], is_bin: np.ndarray) -> Dict[str,
         out[base] = {"sufs": sorted([s for _, s in pairs]), "by_col": {j: s for j, s in pairs}}
     return out
 
-# ===== Threshold rendering utilities =====
+
+# ===== Threshold rendering utilities (dataset-specific defaults are optional) =====
+
 FEATURE_ALIAS = {
     "Age": "Age (years)",
     "BP": "Resting blood pressure (mmHg)",
@@ -129,16 +153,26 @@ CATEGORY_VALUE_LABELS = {
 }
 
 CLINICAL_SNAP = {
-    "Age": 1.0, "BP": 5.0, "Cholesterol": 10.0, "Max HR": 5.0,
-    "ST depression": 0.1, "Number of vessels fluro": 1.0, "Chest pain type": 1.0
+    "Age": 1.0,
+    "BP": 5.0,
+    "Cholesterol": 10.0,
+    "Max HR": 5.0,
+    "ST depression": 0.1,
+    "Number of vessels fluro": 1.0,
+    "Chest pain type": 1.0,
 }
 INTEGER_BASES = {
-    "Number of vessels fluro", "Chest pain type", "Slope of ST",
-    "EKG results", "Thallium"
+    "Number of vessels fluro",
+    "Chest pain type",
+    "Slope of ST",
+    "EKG results",
+    "Thallium",
 }
+
 
 def _alias(base: str, mode: Readability) -> str:
     return base if mode == "exact" else FEATURE_ALIAS.get(base, base)
+
 
 def _cat_label(base: str, val: str, mode: Readability) -> str:
     if mode in ("clinical", "pretty", "simplified"):
@@ -147,8 +181,10 @@ def _cat_label(base: str, val: str, mode: Readability) -> str:
             return m[val]
     return val
 
+
 def _op_sym(op: str) -> str:
     return {"<=": "≤", ">=": "≥", "!=": "≠", "==": "=", "<": "<", ">": ">"}.get(op, op)
+
 
 def _snap_step(base: str, x: float, mode: Readability) -> float:
     if mode != "clinical" or not np.isfinite(x):
@@ -157,6 +193,7 @@ def _snap_step(base: str, x: float, mode: Readability) -> float:
     if not step:
         return float(x)
     return float(round(x / step) * step)
+
 
 def _snap_integer_threshold(base: str, op: str, thr: float, mode: Readability) -> float:
     if not np.isfinite(thr):
@@ -168,6 +205,7 @@ def _snap_integer_threshold(base: str, op: str, thr: float, mode: Readability) -
     if op in ("<", "<="):
         return float(int(math.floor(thr + 1e-9)))
     return float(round(thr))
+
 
 def _fmt_num(base: str, x: float, mode: Readability) -> str:
     if not np.isfinite(x):
@@ -186,6 +224,7 @@ def _fmt_num(base: str, x: float, mode: Readability) -> str:
         return f"{x:.2f}"
     return f"{x:.3f}"
 
+
 def clause_to_text(cl: Clause, mode: Readability) -> str:
     """Render a single clause as human-readable text."""
     base_disp = _alias(cl.base, mode)
@@ -194,80 +233,85 @@ def clause_to_text(cl: Clause, mode: Readability) -> str:
         if mode == "exact" and _split_ohe(cl.raw_feature) is not None:
             return f"{cl.raw_feature} {_op_sym(cl.op)} {val}"
         return f"{base_disp} {_op_sym(cl.op)} {_cat_label(cl.base, val, mode)}"
-    
+
     v = float(cl.value)
     return f"{base_disp} {_op_sym(cl.op)} {_fmt_num(cl.base, v, mode)}"
+
 
 def simplify_clauses(
     clauses: List[Clause],
     mode: Readability,
     *,
     ohe_groups: Dict[str, Any],
-    base_order: Dict[str, int]
+    base_order: Dict[str, int],
 ) -> List[SimplifiedCondition]:
     """Simplify multiple clauses on the same base feature into ranges/sets."""
     by_base: Dict[str, List[Clause]] = {}
     for cl in clauses:
         by_base.setdefault(cl.base, []).append(cl)
-    
+
     out: List[SimplifiedCondition] = []
     for base, cls in by_base.items():
         nums = [c for c in cls if c.kind == "numeric"]
         cats = [c for c in cls if c.kind in ("category", "binary")]
-        
+
         if mode == "exact":
             for c in cls:
-                out.append(SimplifiedCondition(
-                    base=base,
-                    text=clause_to_text(c, mode),
-                    kind="numeric_range" if c.kind == "numeric" else "category_set"
-                ))
+                out.append(
+                    SimplifiedCondition(
+                        base=base,
+                        text=clause_to_text(c, mode),
+                        kind="numeric_range" if c.kind == "numeric" else "category_set",
+                    )
+                )
             continue
-        
-        # Numeric -> range simplification
+
+        # Numeric -> range
         if nums:
             lower = None
             upper = None
             for c in nums:
                 v = float(c.value)
                 if not np.isfinite(v):
-                    out.append(SimplifiedCondition(
-                        base=base,
-                        text=clause_to_text(c, mode),
-                        kind="numeric_range"
-                    ))
+                    out.append(SimplifiedCondition(base=base, text=clause_to_text(c, mode), kind="numeric_range"))
                     continue
                 v = _snap_integer_threshold(base, c.op, v, mode)
                 if c.op in (">", ">="):
                     lower = v if (lower is None or v > lower) else lower
                 if c.op in ("<", "<="):
                     upper = v if (upper is None or v < upper) else upper
-            
+
             base_disp = _alias(base, mode)
             if lower is not None and upper is not None and lower <= upper:
-                out.append(SimplifiedCondition(
-                    base=base,
-                    text=f"{base_disp}: ≥ {_fmt_num(base, lower, mode)} and ≤ {_fmt_num(base, upper, mode)}",
-                    kind="numeric_range",
-                    lower=lower,
-                    upper=upper
-                ))
+                out.append(
+                    SimplifiedCondition(
+                        base=base,
+                        text=f"{base_disp}: ≥ {_fmt_num(base, lower, mode)} and ≤ {_fmt_num(base, upper, mode)}",
+                        kind="numeric_range",
+                        lower=lower,
+                        upper=upper,
+                    )
+                )
             elif lower is not None:
-                out.append(SimplifiedCondition(
-                    base=base,
-                    text=f"{base_disp} ≥ {_fmt_num(base, lower, mode)}",
-                    kind="numeric_range",
-                    lower=lower
-                ))
+                out.append(
+                    SimplifiedCondition(
+                        base=base,
+                        text=f"{base_disp} ≥ {_fmt_num(base, lower, mode)}",
+                        kind="numeric_range",
+                        lower=lower,
+                    )
+                )
             elif upper is not None:
-                out.append(SimplifiedCondition(
-                    base=base,
-                    text=f"{base_disp} ≤ {_fmt_num(base, upper, mode)}",
-                    kind="numeric_range",
-                    upper=upper
-                ))
-        
-        # Categorical -> set simplification
+                out.append(
+                    SimplifiedCondition(
+                        base=base,
+                        text=f"{base_disp} ≤ {_fmt_num(base, upper, mode)}",
+                        kind="numeric_range",
+                        upper=upper,
+                    )
+                )
+
+        # Categorical -> sets
         if cats:
             eq_vals, ne_vals = [], []
             for c in cats:
@@ -275,489 +319,1068 @@ def simplify_clauses(
                     eq_vals.append(str(c.value))
                 if c.op == "!=":
                     ne_vals.append(str(c.value))
-            
+
             base_disp = _alias(base, mode)
             g = ohe_groups.get(base)
             if eq_vals:
                 allowed = sorted(set(eq_vals))
                 if len(allowed) == 1:
-                    out.append(SimplifiedCondition(
-                        base=base,
-                        text=f"{base_disp} = {_cat_label(base, allowed[0], mode)}",
-                        kind="category_set",
-                        allowed=allowed
-                    ))
+                    out.append(
+                        SimplifiedCondition(
+                            base=base,
+                            text=f"{base_disp} = {_cat_label(base, allowed[0], mode)}",
+                            kind="category_set",
+                            allowed=allowed,
+                        )
+                    )
                 else:
                     vs = ", ".join(_cat_label(base, v, mode) for v in allowed)
-                    out.append(SimplifiedCondition(
-                        base=base,
-                        text=f"{base_disp} in {{{vs}}}",
-                        kind="category_set",
-                        allowed=allowed
-                    ))
+                    out.append(
+                        SimplifiedCondition(
+                            base=base,
+                            text=f"{base_disp} in {{{vs}}}",
+                            kind="category_set",
+                            allowed=allowed,
+                        )
+                    )
             elif ne_vals:
                 banned = sorted(set(ne_vals))
                 if g and len(g["sufs"]) == 2 and len(banned) == 1:
                     other = g["sufs"][0] if g["sufs"][1] == banned[0] else g["sufs"][1]
-                    out.append(SimplifiedCondition(
-                        base=base,
-                        text=f"{base_disp} = {_cat_label(base, other, mode)}",
-                        kind="category_set",
-                        allowed=[other]
-                    ))
+                    out.append(
+                        SimplifiedCondition(
+                            base=base,
+                            text=f"{base_disp} = {_cat_label(base, other, mode)}",
+                            kind="category_set",
+                            allowed=[other],
+                        )
+                    )
                 else:
                     if len(banned) == 1:
-                        out.append(SimplifiedCondition(
-                            base=base,
-                            text=f"{base_disp} ≠ {_cat_label(base, banned[0], mode)}",
-                            kind="category_set",
-                            banned=banned
-                        ))
+                        out.append(
+                            SimplifiedCondition(
+                                base=base,
+                                text=f"{base_disp} ≠ {_cat_label(base, banned[0], mode)}",
+                                kind="category_set",
+                                banned=banned,
+                            )
+                        )
                     else:
                         vs = ", ".join(_cat_label(base, v, mode) for v in banned)
-                        out.append(SimplifiedCondition(
-                            base=base,
-                            text=f"{base_disp} not in {{{vs}}}",
-                            kind="category_set",
-                            banned=banned
-                        ))
-    
+                        out.append(
+                            SimplifiedCondition(
+                                base=base,
+                                text=f"{base_disp} not in {{{vs}}}",
+                                kind="category_set",
+                                banned=banned,
+                            )
+                        )
+
     out.sort(key=lambda sc: base_order.get(sc.base, 10_000))
     return out
+
 
 def render_rule(
     clauses: List[Clause],
     mode: Readability,
     *,
     ohe_groups: Dict[str, Any],
-    base_order: Dict[str, int]
+    base_order: Dict[str, int],
 ) -> str:
-    """Render a rule as human-readable text with optional simplification."""
+    """Render a rule as text; optionally simplify."""
     if mode in ("simplified", "clinical"):
         conds = simplify_clauses(clauses, mode, ohe_groups=ohe_groups, base_order=base_order)
         return " AND ".join([c.text for c in conds])
     return " AND ".join([clause_to_text(c, mode) for c in clauses])
 
-# ===== Model-specific interpretation utilities =====
-def _unscale_value(model: Any, j: int, val_scaled: float, scaler: Optional[Any]) -> float:
-    """Convert scaled threshold back to original feature space."""
-    if scaler is None or not hasattr(scaler, 'mean_') or not hasattr(scaler, 'scale_'):
-        return float(val_scaled)
-    return float(scaler.mean_[j] + scaler.scale_[j] * val_scaled)
 
-def _get_threshold_fact_bank(model: Any) -> Optional[Union[ThresholdFactBank, LegacyThresholdFactBank, ARFactBank]]:
-    """Extract threshold fact bank from model if present."""
-    if hasattr(model, 'facts'):
-        facts = model.facts
-        if isinstance(facts, (ThresholdFactBank, LegacyThresholdFactBank, ARFactBank)):
+# ===== Unscaling =====
+
+def _unscale_value(j: int, val_scaled: float, scaler: Optional[Any]) -> float:
+    """Convert scaled threshold back to original feature space."""
+    if scaler is None:
+        return float(val_scaled)
+
+    # Preferred: sklearn-like inverse_transform
+    if hasattr(scaler, "inverse_transform"):
+        try:
+            D = getattr(scaler, "n_features_in_", None)
+            if D is None:
+                # fallback: try mean_/scale_ size
+                if hasattr(scaler, "mean_"):
+                    D = len(scaler.mean_)
+                elif hasattr(scaler, "scale_"):
+                    D = len(scaler.scale_)
+            if D is None:
+                return float(val_scaled)
+            tmp = np.zeros((1, int(D)), dtype=np.float32)
+            tmp[0, int(j)] = float(val_scaled)
+            inv = scaler.inverse_transform(tmp)
+            return float(inv[0, int(j)])
+        except Exception:
+            pass
+
+    # Fallback: StandardScaler-like
+    if hasattr(scaler, "mean_") and hasattr(scaler, "scale_"):
+        return float(scaler.mean_[j] + scaler.scale_[j] * val_scaled)
+
+    return float(val_scaled)
+
+
+# ===== Fact bank discovery + decoding =====
+
+def _get_threshold_fact_bank(model: Any) -> Optional[Any]:
+    """Extract a threshold-ish fact bank from a model if present."""
+    if hasattr(model, "facts"):
+        facts = getattr(model, "facts")
+        if isinstance(facts, (ThresholdFactBank, ARFactBank, IntervalFactBank, MultiResAxisFactBank)):
             return facts
-    if hasattr(model, 'axis'):
-        return model.axis
-    if hasattr(model, 'base_facts'):
-        return model.base_facts
+    if hasattr(model, "axis"):
+        return getattr(model, "axis")
+    if hasattr(model, "base_facts"):
+        return getattr(model, "base_facts")
     return None
+
+
+def _threshold_layout_from_factbank(fb: Any, D: int) -> Optional[Tuple[int, int]]:
+    """Infer (D,K) for axis threshold banks where facts are D*K."""
+    if hasattr(fb, "th"):
+        th = fb.th
+        if isinstance(th, torch.Tensor):
+            shp = tuple(th.shape)
+        else:
+            shp = tuple(np.asarray(th).shape)
+        if len(shp) == 2 and shp[0] == D:
+            return D, int(shp[1])
+    # fallback from num_facts
+    if hasattr(fb, "num_facts"):
+        F0 = int(getattr(fb, "num_facts"))
+        if D > 0 and F0 % D == 0:
+            return D, int(F0 // D)
+    return None
+
+
+def _axis_threshold_value(fb: Any, j: int, k: int) -> float:
+    """Get threshold value from axis threshold fact bank."""
+    th = fb.th
+    if isinstance(th, torch.Tensor):
+        return float(th[j, k].detach().cpu().item())
+    return float(np.asarray(th)[j, k])
+
 
 def _extract_threshold_facts(
     model: Any,
     feature_names: Sequence[str],
     scaler: Optional[Any] = None,
-    readability: Readability = "clinical"
-) -> List[Dict]:
-    """Extract human-readable threshold facts from fact bank."""
+    readability: Readability = "clinical",
+    X_ref: Optional[np.ndarray] = None,
+) -> List[Dict[str, Any]]:
+    """Extract human-readable threshold facts from a fact bank (global, not rules)."""
     facts = _get_threshold_fact_bank(model)
     if facts is None:
         return []
-    
-    # Handle different fact bank types
+
     if isinstance(facts, ARFactBank):
-        # Extract axis facts only (relational facts are harder to interpret)
         facts = facts.axis
-    
+
     D = len(feature_names)
-    is_bin = _feature_is_binary(np.zeros((1, D)))  # placeholder; real usage needs data
-    
-    # Get thresholds and parameters
-    if hasattr(facts, 'th'):
-        th = facts.th.detach().cpu().numpy()
-        feat_idx = facts.feat_idx.detach().cpu().numpy() if hasattr(facts, 'feat_idx') else np.arange(len(th))
-    elif hasattr(facts, 'a') and hasattr(facts, 'log_width'):
-        # Interval facts
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
+
+    out: List[Dict[str, Any]] = []
+
+    # IntervalFactBank: represent each interval as midpoint threshold (coarse global view)
+    if isinstance(facts, IntervalFactBank):
         a = facts.a.detach().cpu().numpy()
-        b = a + np.exp(facts.log_width.detach().cpu().numpy())
-        # We'll use midpoints for simplicity in global view
-        th = (a + b) / 2
-        feat_idx = facts.feat_idx.detach().cpu().numpy() if hasattr(facts, 'feat_idx') else np.arange(len(th))
-    else:
-        return []
-    
-    # Build clauses for each fact
-    clauses_list = []
-    for i in range(len(th)):
-        j = int(feat_idx[i]) if i < len(feat_idx) else i % D
-        if j >= D:
-            continue
-        
-        raw_feat = feature_names[j]
-        sp = _split_ohe(raw_feat)
-        base = sp[0] if sp else raw_feat
-        
-        # Determine clause properties
-        if is_bin[j] and sp is not None:
-            # Binary/OHE feature
-            clauses_list.append({
-                'fact_idx': i,
-                'clauses': [Clause(
-                    base=base,
-                    kind="category",
-                    op="==",
-                    value=sp[1] if sp else "1",
-                    raw_feature=raw_feat,
-                    feature_index=j
-                )]
-            })
-        else:
-            # Numeric feature - use midpoint threshold
-            thr_u = _unscale_value(model, j, float(th[i]), scaler)
-            clauses_list.append({
-                'fact_idx': i,
-                'clauses': [Clause(
-                    base=base,
-                    kind="numeric",
-                    op=">=",
-                    value=float(thr_u),
-                    raw_feature=raw_feat,
-                    feature_index=j
-                )]
-            })
-    
-    return clauses_list
+        w = np.exp(facts.log_width.detach().cpu().numpy())
+        mid = a + 0.5 * w
+        feat_idx = facts.feat_idx.detach().cpu().numpy()
+        for i in range(len(mid)):
+            j = int(feat_idx[i])
+            if j >= D:
+                continue
+            raw_feat = feature_names[j]
+            sp = _split_ohe(raw_feat)
+            base = sp[0] if sp else raw_feat
+            thr_u = _unscale_value(j, float(mid[i]), scaler)
+
+            out.append(
+                {
+                    "fact_idx": int(i),
+                    "clauses": [
+                        Clause(
+                            base=base,
+                            kind="numeric",
+                            op=">=",
+                            value=float(thr_u),
+                            raw_feature=raw_feat,
+                            feature_index=j,
+                        )
+                    ],
+                }
+            )
+        return out
+
+    # MultiResAxisFactBank: thresholds stored as [D,K], but facts are S*D*K (multiple kappas).
+    if isinstance(facts, MultiResAxisFactBank):
+        K = int(facts.K)
+        # Create one clause per (d,k) (ignoring kappa resolution) as "fact templates"
+        for j in range(D):
+            for k in range(K):
+                raw_feat = feature_names[j]
+                sp = _split_ohe(raw_feat)
+                base = sp[0] if sp else raw_feat
+                thr_u = _unscale_value(j, float(facts.th[j, k].detach().cpu().item()), scaler)
+                out.append(
+                    {
+                        "fact_idx": int(j * K + k),
+                        "clauses": [
+                            Clause(
+                                base=base,
+                                kind="numeric",
+                                op=">=",
+                                value=float(thr_u),
+                                raw_feature=raw_feat,
+                                feature_index=j,
+                            )
+                        ],
+                    }
+                )
+        return out
+
+    # ThresholdFactBank: interpret each fact as x_j >= th[j,k]
+    if hasattr(facts, "th"):
+        layout = _threshold_layout_from_factbank(facts, D)
+        if layout is None:
+            return []
+        _, K = layout
+        for j in range(D):
+            raw_feat = feature_names[j]
+            sp = _split_ohe(raw_feat)
+            base = sp[0] if sp else raw_feat
+            for k in range(K):
+                thr_u = _unscale_value(j, _axis_threshold_value(facts, j, k), scaler)
+                # If OHE binary, map ">= threshold" into ==/!= semantics is not robust globally.
+                # Keep numeric representation unless it clearly looks OHE-binary.
+                if bool(is_bin[j]) and sp is not None:
+                    out.append(
+                        {
+                            "fact_idx": int(j * K + k),
+                            "clauses": [
+                                Clause(
+                                    base=base,
+                                    kind="category",
+                                    op="==",
+                                    value=sp[1],
+                                    raw_feature=raw_feat,
+                                    feature_index=j,
+                                )
+                            ],
+                        }
+                    )
+                else:
+                    out.append(
+                        {
+                            "fact_idx": int(j * K + k),
+                            "clauses": [
+                                Clause(
+                                    base=base,
+                                    kind="numeric",
+                                    op=">=",
+                                    value=float(thr_u),
+                                    raw_feature=raw_feat,
+                                    feature_index=j,
+                                )
+                            ],
+                        }
+                    )
+        return out
+
+    return []
+
+
+# ===== Model-family detection (lazy imports) =====
+
+def _classes():
+    """Import zoo_v2 model classes lazily to avoid hard import costs/cycles."""
+    from ..zoo_v2.models import (
+        # evidence
+        EvidenceNet,
+        MarginEvidenceNet,
+        PerFeatureKappaEvidenceNet,
+        LadderEvidenceNet,
+        BiEvidenceNet,
+        EvidenceKofNNet,
+        # corner
+        CornerNet,
+        SoftMinCornerNet,
+        KofNCornerNet,
+        RingCornerNet,
+        HybridCornerIntervalNet,
+        # forests
+        PredicateForest,
+        ObliviousForest,
+        LeafLinearForest,
+        AttentiveForest,
+        MultiResForest,
+        GroupFirstForest,
+        BudgetedForest,
+        # group evidence (global only fallback to evidence-like is okay)
+        GroupEvidenceKofNNet,
+        SoftGroupEvidenceKofNNet,
+        GroupSoftMinNet,
+        GroupContrastNet,
+        GroupRingNet,
+        # regime
+        RegimeRulesNet,
+        # scorecard
+        ScorecardWithRules,
+    )
+    return locals()
+
+
+# ===== Global extraction: Evidence-family =====
 
 def _extract_evidence_rules(
     model: Any,
     feature_names: Sequence[str],
     scaler: Optional[Any] = None,
     readability: Readability = "clinical",
-    top_feats: int = 4
-) -> List[Dict]:
-    """Extract rules from EvidenceNet family models."""
+    top_feats: int = 4,
+    X_ref: Optional[np.ndarray] = None,
+    class_idx: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Extract approximate rules from EvidenceNet-like models."""
     D = len(feature_names)
-    is_bin = _feature_is_binary(np.zeros((1, D)))  # placeholder
-    
-    # Get model parameters
-    if not hasattr(model, 'th') or not hasattr(model, 'head'):
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
+
+    # Identify parameterization
+    th = getattr(model, "th", None)
+    if th is None:
         return []
-    
-    th = model.th.detach().cpu().numpy()
-    R, D_model = th.shape
-    
-    # Get evidence signs and masks
-    if hasattr(model, 'e_sign_param'):
-        es = np.tanh(model.e_sign_param.detach().cpu().numpy())
-        ineq = np.tanh(model.ineq_sign_param.detach().cpu().numpy())
-        mask = torch.sigmoid(model.mask_logit).detach().cpu().numpy() if hasattr(model, 'mask_logit') else np.ones_like(th)
-    elif hasattr(model, 'esign'):
-        es = np.tanh(model.esign.detach().cpu().numpy())
-        ineq = np.tanh(model.ineq.detach().cpu().numpy())
-        mask = torch.sigmoid(model.mask).detach().cpu().numpy() if hasattr(model, 'mask') else np.ones_like(th)
+    th = th.detach().cpu().numpy()  # [R,Dm]
+    R, Dm = th.shape
+    if Dm != D:
+        # still try best-effort: only decode min(D,Dm)
+        D_use = min(D, Dm)
     else:
+        D_use = D
+
+    # ineq sign
+    if hasattr(model, "ineq_sign_param"):
+        ineq = np.tanh(model.ineq_sign_param.detach().cpu().numpy())
+    elif hasattr(model, "ineq"):
+        ineq = np.tanh(model.ineq.detach().cpu().numpy())
+    else:
+        ineq = np.ones_like(th)
+
+    # evidence sign
+    if hasattr(model, "e_sign_param"):
+        es = np.tanh(model.e_sign_param.detach().cpu().numpy())
+    elif hasattr(model, "esign"):
+        es = np.tanh(model.esign.detach().cpu().numpy())
+    else:
+        es = np.ones_like(th)
+
+    # mask
+    if hasattr(model, "mask_logit"):
+        mask = torch.sigmoid(model.mask_logit).detach().cpu().numpy()
+    elif hasattr(model, "mask"):
+        mask = torch.sigmoid(model.mask).detach().cpu().numpy()
+    else:
+        mask = np.ones_like(th)
+
+    # head weights
+    if not hasattr(model, "head"):
         return []
-    
-    # Get head weights
-    w = model.head.weight.detach().cpu().numpy().flatten()
-    
-    rules = []
-    for r in range(min(R, 100)):  # limit to 100 rules for performance
-        # Compute feature importance scores for this rule
-        score = mask[r] * (0.6 + 0.4 * np.abs(es[r]))
-        fidx = np.argsort(-score)[:top_feats]
-        
-        clauses = []
-        for j in fidx:
-            j = int(j)
-            if j >= D:
-                continue
-            
+    W = model.head.weight.detach().cpu().numpy()
+    if W.ndim == 1:
+        w = W
+    else:
+        # choose class
+        c = int(class_idx) if class_idx is not None else 0
+        c = max(0, min(c, W.shape[0] - 1))
+        w = W[c]
+
+    rules: List[Dict[str, Any]] = []
+    for r in range(R):
+        # rank features for this rule
+        score = mask[r, :D_use] * (0.6 + 0.4 * np.abs(es[r, :D_use]))
+        fidx = np.argsort(-score)[: int(top_feats)]
+
+        clauses: List[Clause] = []
+        for jj in fidx:
+            j = int(jj)
             raw_feat = feature_names[j]
             sp = _split_ohe(raw_feat)
             base = sp[0] if sp else raw_feat
-            
-            # Determine operator direction
+
+            # Base inequality direction from ineq
             op_base = ">=" if ineq[r, j] >= 0 else "<="
+            # Evidence sign flips the "desired" direction
             op = op_base if es[r, j] >= 0 else ("<=" if op_base == ">=" else ">=")
-            
-            # Get unscaled threshold
-            thr_u = _unscale_value(model, j, float(th[r, j]), scaler)
-            
-            # Create clause
-            if is_bin[j] and sp is not None:
+
+            thr_u = _unscale_value(j, float(th[r, j]), scaler)
+
+            if bool(is_bin[j]) and sp is not None:
                 want_one = op in (">", ">=")
-                clauses.append(Clause(
-                    base=base,
-                    kind="category",
-                    op=("==" if want_one else "!="),
-                    value=sp[1] if sp else str(int(want_one)),
-                    raw_feature=raw_feat,
-                    feature_index=j
-                ))
+                clauses.append(
+                    Clause(
+                        base=base,
+                        kind="category",
+                        op=("==" if want_one else "!="),
+                        value=sp[1],
+                        raw_feature=raw_feat,
+                        feature_index=j,
+                    )
+                )
             else:
-                clauses.append(Clause(
-                    base=base,
-                    kind="numeric",
-                    op=op,
-                    value=float(thr_u),
-                    raw_feature=raw_feat,
-                    feature_index=j
-                ))
-        
-        rules.append({
-            'rule_idx': r,
-            'weight': float(w[r]) if r < len(w) else 0.0,
-            'clauses': clauses,
-            'direction': 'increases' if w[r] > 0 else 'decreases' if r < len(w) else 'unknown'
-        })
-    
-    # Sort by absolute weight
-    rules.sort(key=lambda r: abs(r['weight']), reverse=True)
+                clauses.append(
+                    Clause(
+                        base=base,
+                        kind="numeric",
+                        op=op,
+                        value=float(thr_u),
+                        raw_feature=raw_feat,
+                        feature_index=j,
+                    )
+                )
+
+        rules.append(
+            {
+                "rule_idx": int(r),
+                "weight": float(w[r]) if r < len(w) else 0.0,
+                "clauses": clauses,
+                "direction": "increases" if (r < len(w) and w[r] > 0) else "decreases",
+            }
+        )
+
+    rules.sort(key=lambda rr: abs(rr["weight"]), reverse=True)
     return rules
+
+
+# ===== Global extraction: Corner-family =====
+
+def _extract_corner_rules(
+    model: Any,
+    feature_names: Sequence[str],
+    scaler: Optional[Any] = None,
+    readability: Readability = "clinical",
+    top_feats: int = 4,
+    X_ref: Optional[np.ndarray] = None,
+    class_idx: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Extract approximate conjunction rules from CornerNet-like models."""
+    D = len(feature_names)
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
+
+    if not hasattr(model, "th") or not hasattr(model, "head"):
+        return []
+
+    th = model.th.detach().cpu().numpy()  # [R,D]
+    R, Dm = th.shape
+    D_use = min(D, Dm)
+
+    # sign direction (ineq)
+    if hasattr(model, "sign_param"):
+        ineq = np.tanh(model.sign_param.detach().cpu().numpy())
+    elif hasattr(model, "sign_c"):
+        ineq = np.tanh(model.sign_c.detach().cpu().numpy())
+    else:
+        ineq = np.ones_like(th)
+
+    # mask
+    if hasattr(model, "mask_logit"):
+        mask = torch.sigmoid(model.mask_logit).detach().cpu().numpy()
+    elif hasattr(model, "mask"):
+        mask = torch.sigmoid(model.mask).detach().cpu().numpy()
+    else:
+        mask = np.ones_like(th)
+
+    W = model.head.weight.detach().cpu().numpy()
+    if W.ndim == 1:
+        w = W
+    else:
+        c = int(class_idx) if class_idx is not None else 0
+        c = max(0, min(c, W.shape[0] - 1))
+        w = W[c]
+
+    rules: List[Dict[str, Any]] = []
+    for r in range(R):
+        score = mask[r, :D_use] * (0.6 + 0.4 * np.abs(ineq[r, :D_use]))
+        fidx = np.argsort(-score)[: int(top_feats)]
+
+        clauses: List[Clause] = []
+        for jj in fidx:
+            j = int(jj)
+            raw_feat = feature_names[j]
+            sp = _split_ohe(raw_feat)
+            base = sp[0] if sp else raw_feat
+
+            op = ">=" if ineq[r, j] >= 0 else "<="
+            thr_u = _unscale_value(j, float(th[r, j]), scaler)
+
+            if bool(is_bin[j]) and sp is not None:
+                want_one = op in (">", ">=")
+                clauses.append(
+                    Clause(
+                        base=base,
+                        kind="category",
+                        op=("==" if want_one else "!="),
+                        value=sp[1],
+                        raw_feature=raw_feat,
+                        feature_index=j,
+                    )
+                )
+            else:
+                clauses.append(
+                    Clause(
+                        base=base,
+                        kind="numeric",
+                        op=op,
+                        value=float(thr_u),
+                        raw_feature=raw_feat,
+                        feature_index=j,
+                    )
+                )
+
+        rules.append(
+            {
+                "rule_idx": int(r),
+                "weight": float(w[r]) if r < len(w) else 0.0,
+                "clauses": clauses,
+                "direction": "increases" if (r < len(w) and w[r] > 0) else "decreases",
+            }
+        )
+
+    rules.sort(key=lambda rr: abs(rr["weight"]), reverse=True)
+    return rules
+
+
+# ===== Global extraction: Forest-family =====
+
+def _sel_probs(logits: torch.Tensor, selector: str, tau: float = 0.7, dim: int = -1) -> torch.Tensor:
+    if selector == "sparsemax":
+        return sparsemax(logits, dim=dim)
+    return torch.softmax(logits / max(float(tau), 1e-6), dim=dim)
+
+
+def _decode_fact_index_to_jk(
+    facts: Any,
+    D: int,
+    base_idx: int,
+) -> Tuple[int, int, Optional[float]]:
+    """Decode a base fact index (0..F0-1) into (feature j, thresh k, thr_value).
+
+    Supports ThresholdFactBank-like and MultiResAxisFactBank layouts.
+    """
+    # MultiResAxisFactBank flattening is [S,D,K] with K=facts.K
+    if isinstance(facts, MultiResAxisFactBank):
+        K = int(facts.K)
+        tmp = int(base_idx // K)
+        j = int(tmp % D)
+        k = int(base_idx % K)
+        thr = float(facts.th[j, k].detach().cpu().item())
+        return j, k, thr
+
+    # ThresholdFactBank: assume D*K facts with per-feature contiguous block
+    layout = _threshold_layout_from_factbank(facts, D)
+    if layout is None:
+        j = int(base_idx % D)
+        return j, 0, None
+    _, K = layout
+    j = int(base_idx // K)
+    k = int(base_idx % K)
+    thr = _axis_threshold_value(facts, j, k)
+    return j, k, float(thr)
+
 
 def _extract_forest_rules(
     model: Any,
     feature_names: Sequence[str],
     scaler: Optional[Any] = None,
     readability: Readability = "clinical",
-    n_trees: int = 6
-) -> List[Dict]:
-    """Extract crisp rules from forest models."""
-    if not hasattr(model, 'sel_logits') or not hasattr(model, 'leaf_value'):
+    n_trees: int = 6,
+    X_ref: Optional[np.ndarray] = None,
+) -> List[Dict[str, Any]]:
+    """Extract crisp (approximate) rules from forest models by:
+    - argmax selector per depth
+    - choose leaf with largest |leaf_value| per tree
+    """
+    if not hasattr(model, "sel_logits") or not hasattr(model, "leaf_value") or not hasattr(model, "facts"):
         return []
-    
+
     D = len(feature_names)
-    is_bin = _feature_is_binary(np.zeros((1, D)))  # placeholder
-    
-    sel = torch.softmax(model.sel_logits / max(0.7, 1e-6), dim=1).detach().cpu().numpy()
-    leaf = model.leaf_value.detach().cpu().numpy()
-    
-    T = int(model.T) if hasattr(model, 'T') else sel.shape[0] // (int(model.depth) if hasattr(model, 'depth') else 4)
-    depth = int(model.depth) if hasattr(model, 'depth') else 4
-    Fin = sel.shape[1]
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
+
+    facts = model.facts
+    sel_logits = model.sel_logits.detach()
+    leaf = model.leaf_value.detach()
+
+    T = int(getattr(model, "T", 0)) or int(getattr(model, "n_trees", 0)) or None
+    depth = int(getattr(model, "depth", 0)) or None
+    selector = str(getattr(model, "selector", "sparsemax"))
+    tau = float(getattr(model, "tau_select", 0.7))
+
+    # Infer T/depth if not present
+    if T is None or depth is None or T <= 0 or depth <= 0:
+        # sel_logits is [T*depth, Fin]
+        # if depth exists use it; else guess depth=4
+        depth = depth or 4
+        T = sel_logits.shape[0] // depth
+
+    Fin = int(sel_logits.shape[1])
     F0 = Fin // 2
-    
-    # Get threshold grid if available
-    th_grid = None
-    if hasattr(model, 'facts') and hasattr(model.facts, 'th'):
-        th_grid = model.facts.th.detach().cpu().numpy()
-    elif hasattr(model, 'th'):
-        th_grid = model.th.detach().cpu().numpy()
-    
-    rules = []
-    for t in range(min(n_trees, T)):
-        # Get top feature selector per depth
-        sel_t = sel[t*depth:(t+1)*depth] if sel.shape[0] > T else sel.reshape(T, depth, Fin)[t]
+
+    sel = _sel_probs(sel_logits, selector=selector, tau=tau, dim=1).cpu().numpy()
+    sel = sel.reshape(T, depth, Fin)
+
+    leaf_np = leaf.cpu().numpy()
+    # leaf_np: [T,L] or [T,L,C]
+    if leaf_np.ndim == 3:
+        # choose class 0 by default for global
+        leaf_score = leaf_np[:, :, 0]
+    else:
+        leaf_score = leaf_np
+
+    rules: List[Dict[str, Any]] = []
+    for t in range(min(int(n_trees), int(T))):
+        sel_t = sel[t]  # [depth,Fin]
         topf = [int(np.argmax(sel_t[d])) for d in range(depth)]
-        
-        # Get leaf index with highest value
-        leaf_idx = int(np.argmax(leaf[t]) if leaf.ndim == 2 else np.argmax(leaf))
-        leaf_score = float(leaf[t, leaf_idx] if leaf.ndim == 2 else leaf[leaf_idx])
-        
-        clauses = []
+
+        # pick leaf with max |value|
+        li = int(np.argmax(np.abs(leaf_score[t])))
+        lv = float(leaf_score[t, li])
+
+        clauses: List[Clause] = []
         for d in range(depth):
-            bit = (leaf_idx >> (depth - 1 - d)) & 1  # right=1
-            f_idx = topf[d]
-            is_neg = (f_idx >= F0)
+            bit = (li >> (depth - 1 - d)) & 1  # 1 => go "right" => literal true
+
+            f_idx = int(topf[d])
+            is_neg = f_idx >= F0
             base_idx = f_idx - F0 if is_neg else f_idx
-            j = int(base_idx // (Fin // (2 * D))) if Fin > 2 * D else base_idx % D
-            
-            if j >= D:
+
+            j, k, thr_scaled = _decode_fact_index_to_jk(facts, D, base_idx)
+            if j < 0 or j >= D:
                 continue
-            
+
             raw_feat = feature_names[j]
             sp = _split_ohe(raw_feat)
             base = sp[0] if sp else raw_feat
-            
-            # Determine operator
-            negate = (bit == 0)
-            want_one = not (is_neg ^ negate)
-            
-            if is_bin[j] and sp is not None:
-                clauses.append(Clause(
-                    base=base,
-                    kind="category",
-                    op=("==" if want_one else "!="),
-                    value=sp[1] if sp else str(int(want_one)),
-                    raw_feature=raw_feat,
-                    feature_index=j
-                ))
+
+            # literal truth table:
+            # - if selector chooses f (x>=thr), literal true => x>=thr
+            # - if selector chooses (1-f) (x<thr), literal true => x<=thr
+            # leaf bit=1 wants literal true, bit=0 wants literal false.
+            # So final op depends on (is_neg XOR (bit==1)) etc.
+            want_literal_true = (bit == 1)
+            if not is_neg:
+                # literal is f
+                op = ">=" if want_literal_true else "<="
             else:
-                # Get threshold value
-                thr_u = float("nan")
-                if th_grid is not None:
-                    if th_grid.ndim == 2:
-                        thr_u = _unscale_value(model, j, float(th_grid[j, base_idx % (Fin // (2 * D))]), scaler)
-                    else:
-                        thr_u = _unscale_value(model, j, float(th_grid[t, j]), scaler)
-                
-                op = "<=" if is_neg ^ negate else ">="
-                clauses.append(Clause(
-                    base=base,
-                    kind="numeric",
-                    op=op,
-                    value=float(thr_u),
-                    raw_feature=raw_feat,
-                    feature_index=j
-                ))
-        
-        rules.append({
-            'tree_idx': t,
-            'leaf_idx': leaf_idx,
-            'leaf_score': leaf_score,
-            'clauses': clauses,
-            'direction': 'increases' if leaf_score > 0 else 'decreases'
-        })
-    
-    # Sort by absolute leaf score
-    rules.sort(key=lambda r: abs(r['leaf_score']), reverse=True)
+                # literal is (1-f)
+                op = "<=" if want_literal_true else ">="
+
+            if bool(is_bin[j]) and sp is not None:
+                want_one = op in (">", ">=")
+                clauses.append(
+                    Clause(
+                        base=base,
+                        kind="category",
+                        op=("==" if want_one else "!="),
+                        value=sp[1],
+                        raw_feature=raw_feat,
+                        feature_index=j,
+                    )
+                )
+            else:
+                thr_u = float("nan") if thr_scaled is None else _unscale_value(j, float(thr_scaled), scaler)
+                clauses.append(
+                    Clause(
+                        base=base,
+                        kind="numeric",
+                        op=op,
+                        value=float(thr_u),
+                        raw_feature=raw_feat,
+                        feature_index=j,
+                    )
+                )
+
+        rules.append(
+            {
+                "tree_idx": int(t),
+                "leaf_idx": int(li),
+                "leaf_score": float(lv),
+                "clauses": clauses,
+                "direction": "increases" if lv > 0 else "decreases",
+            }
+        )
+
+    rules.sort(key=lambda rr: abs(rr["leaf_score"]), reverse=True)
     return rules
 
+
+# ===== Local contributions =====
+
+def _device_of(model: Any) -> torch.device:
+    for p in model.parameters():
+        return p.device
+    return torch.device("cpu")
+
+
+def _sigmoid_np(x: float) -> float:
+    return float(1.0 / (1.0 + math.exp(-float(x))))
+
+
+def _predict_logits(model: Any, x_scaled_2d: np.ndarray) -> np.ndarray:
+    model.eval()
+    with torch.no_grad():
+        xt = torch.tensor(x_scaled_2d, dtype=torch.float32, device=_device_of(model))
+        y = model(xt)
+        y = y.detach().cpu().numpy()
+    return np.asarray(y).reshape(-1)
+
+
+def _pick_class(logits: np.ndarray) -> int:
+    if logits.size <= 1:
+        return 0
+    return int(np.argmax(logits))
+
+
+def _compute_meta_from_logits(logits: np.ndarray) -> Dict[str, Any]:
+    if logits.size <= 1:
+        logit = float(logits.ravel()[0])
+        prob = _sigmoid_np(logit)
+        pred = int(logit > 0)
+        return {"logit": logit, "prob": prob, "prediction": pred, "class_idx": 0}
+
+    c = int(np.argmax(logits))
+    z = logits - np.max(logits)
+    p = np.exp(z) / (np.exp(z).sum() + 1e-12)
+    return {"logit": float(np.max(logits)), "prob": float(p[c]), "prediction": c, "class_idx": c}
+
+
+def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
+    """Return z: [R] for EvidenceNet-like models (output_dim independent)."""
+    # EvidenceNet / MarginEvidenceNet
+    if hasattr(model, "th") and hasattr(model, "ineq_sign_param") and hasattr(model, "e_sign_param") and hasattr(model, "mask_logit"):
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0) if hasattr(model, "log_kappa") else xt.new_tensor(6.0)
+        ineq = torch.tanh(model.ineq_sign_param)
+        if hasattr(model, "margin_param"):
+            margin = torch.nn.functional.softplus(model.margin_param)
+            c = torch.sigmoid(kappa * (ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]) - margin[None, :, :]))
+        else:
+            c = torch.sigmoid(kappa * ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]))
+        m = torch.sigmoid(model.mask_logit)[None, :, :]
+        es = torch.tanh(model.e_sign_param)[None, :, :]
+        evidence = (m * es * (2.0 * c - 1.0)).sum(dim=2)
+        beta = float(getattr(model, "beta", 6.0))
+        z = torch.sigmoid(beta * (evidence - model.t[None, :]))
+        return z[0]
+
+    # PerFeatureKappaEvidenceNet
+    if hasattr(model, "th") and hasattr(model, "ineq") and hasattr(model, "esign") and hasattr(model, "mask") and hasattr(model, "log_kappa"):
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)  # [R,D]
+        ineq = torch.tanh(model.ineq)
+        c = torch.sigmoid(kappa[None, :, :] * ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]))
+        m = torch.sigmoid(model.mask)[None, :, :]
+        es = torch.tanh(model.esign)[None, :, :]
+        evidence = (m * es * (2.0 * c - 1.0)).sum(dim=2)
+        beta = float(getattr(model, "beta", 6.0))
+        z = torch.sigmoid(beta * (evidence - model.t[None, :]))
+        return z[0]
+
+    # LadderEvidenceNet
+    if hasattr(model, "th0") and hasattr(model, "delta") and hasattr(model, "ineq") and hasattr(model, "esign") and hasattr(model, "mask"):
+        # replicate LadderEvidenceNet._thresholds()
+        inc = torch.nn.functional.softplus(model.delta)
+        th = torch.cat([model.th0[:, :, None], model.th0[:, :, None] + torch.cumsum(inc, dim=2)], dim=2)  # [R,D,L]
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+        ineq = torch.tanh(model.ineq)
+        c = torch.sigmoid(kappa * ineq[None, :, :, None] * (xt[:, None, :, None] - th[None, :, :, :]))  # [1,R,D,L]
+        w = torch.nn.functional.softplus(model.level_w_param) + 1e-6
+        sev = (c * w[None, None, None, :]).sum(dim=3) / w.sum()  # [1,R,D]
+        m = torch.sigmoid(model.mask)[None, :, :]
+        es = torch.tanh(model.esign)[None, :, :]
+        evidence = (m * es * (2.0 * sev - 1.0)).sum(dim=2)
+        beta = float(getattr(model, "beta", 6.0))
+        z = torch.sigmoid(beta * (evidence - model.t[None, :]))
+        return z[0]
+
+    # BiEvidenceNet
+    if hasattr(model, "center") and hasattr(model, "log_width") and hasattr(model, "e_low") and hasattr(model, "e_high") and hasattr(model, "mask"):
+        width = torch.exp(model.log_width).clamp(1e-3, 50.0)
+        t_low = model.center - 0.5 * width
+        t_high = model.center + 0.5 * width
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+        low = torch.sigmoid(kappa * (t_low[None, :, :] - xt[:, None, :]))
+        high = torch.sigmoid(kappa * (xt[:, None, :] - t_high[None, :, :]))
+        m = torch.sigmoid(model.mask)[None, :, :]
+        el = torch.tanh(model.e_low)[None, :, :]
+        eh = torch.tanh(model.e_high)[None, :, :]
+        evidence = (m * (el * (2.0 * low - 1.0) + eh * (2.0 * high - 1.0))).sum(dim=2)
+        beta = float(getattr(model, "beta", 6.0))
+        z = torch.sigmoid(beta * (evidence - model.t[None, :]))
+        return z[0]
+
+    # EvidenceKofNNet
+    if hasattr(model, "th") and hasattr(model, "k_frac_param") and hasattr(model, "t_e") and hasattr(model, "head"):
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+        ineq = torch.tanh(model.ineq_sign_param)
+        c = torch.sigmoid(kappa * ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]))
+        m = torch.sigmoid(model.mask_logit)
+        es = torch.tanh(model.e_sign_param)
+        evidence = (m[None, :, :] * es[None, :, :] * (2.0 * c - 1.0)).sum(dim=2)
+        count = (m[None, :, :] * c).sum(dim=2)
+        msum = (m.sum(dim=1)[None, :] + 1e-6)
+        k = torch.sigmoid(model.k_frac_param)[None, :] * msum
+        z = torch.sigmoid(float(model.alpha) * (evidence - model.t_e[None, :])) * torch.sigmoid(float(model.beta) * (count - k))
+        return z[0]
+
+    raise TypeError("Unsupported evidence-like model for local rule activations.")
+
+
+def _corner_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
+    """Return z: [R] for CornerNet-like models."""
+    # CornerNet / SoftMinCornerNet / KofNCornerNet
+    if hasattr(model, "th") and hasattr(model, "sign_param") and hasattr(model, "mask_logit") and hasattr(model, "log_kappa"):
+        z, _, _ = corner_product_z(xt, model.th, model.sign_param, model.mask_logit, model.log_kappa)
+        return z[0]
+
+    # RingCornerNet: zo*(1-zi)
+    if hasattr(model, "th_o") and hasattr(model, "sign_o") and hasattr(model, "mask_o") and hasattr(model, "th_i"):
+        zo, _, _ = corner_product_z(xt, model.th_o, model.sign_o, model.mask_o, model.log_kappa)
+        zi, _, _ = corner_product_z(xt, model.th_i, model.sign_i, model.mask_i, model.log_kappa)
+        return (zo * (1.0 - zi))[0]
+
+    # HybridCornerIntervalNet: use its forward pieces approximately by re-calling forward and backing out head?
+    # We *can* compute rule activations by re-implementing its z.
+    if hasattr(model, "th_c") and hasattr(model, "sign_c") and hasattr(model, "center") and hasattr(model, "log_width"):
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+        sgn = torch.tanh(model.sign_c)
+        c_corner = torch.sigmoid(kappa * sgn[None, :, :] * (xt[:, None, :] - model.th_c[None, :, :]))
+
+        width = torch.exp(model.log_width).clamp(1e-3, 50.0)
+        a = model.center - 0.5 * width
+        b = model.center + 0.5 * width
+        c_int = torch.sigmoid(kappa * (xt[:, None, :] - a[None, :, :])) * torch.sigmoid(kappa * (b[None, :, :] - xt[:, None, :]))
+
+        t = torch.softmax(model.type_logits, dim=2)  # [R,D,2]
+        c = t[None, :, :, 0] * c_corner + t[None, :, :, 1] * c_int
+        m = torch.sigmoid(model.mask_logit)
+        term = (1.0 - m[None, :, :]) + m[None, :, :] * c
+        z = torch.exp(safe_log(term).sum(dim=2)).clamp(0.0, 1.0)
+        return z[0]
+
+    raise TypeError("Unsupported corner-like model for local rule activations.")
+
+
+def _forest_tree_outputs(model: Any, xt: torch.Tensor, class_idx: int = 0) -> torch.Tensor:
+    """Compute per-tree outputs for forest family (for a single sample). Returns [T]."""
+    # Shared structure: facts -> f_aug -> p selectors -> leaf probs -> leaf mix.
+    if not hasattr(model, "facts") or not hasattr(model, "sel_logits") or not hasattr(model, "leaf_value"):
+        raise TypeError("Model missing forest attributes.")
+
+    f = model.facts(xt)  # [1,F0] or [1,num_facts]
+    f_aug = torch.cat([f, 1.0 - f], dim=1)
+
+    selector = str(getattr(model, "selector", "sparsemax"))
+    tau = float(getattr(model, "tau_select", 0.7))
+    depth = int(getattr(model, "depth", 4))
+    T = int(getattr(model, "T", model.sel_logits.shape[0] // depth))
+
+    sel = _sel_probs(model.sel_logits, selector=selector, tau=tau, dim=1).view(T, depth, -1)  # [T,depth,Fin]
+    p = torch.einsum("bf,tdf->btd", f_aug, sel).clamp(1e-6, 1 - 1e-6)  # [1,T,depth]
+
+    probs = xt.new_ones(1, T, 1)
+    for d in range(depth):
+        pd = p[:, :, d].unsqueeze(-1)
+        probs = torch.cat([probs * (1.0 - pd), probs * pd], dim=2)  # [1,T,L]
+    # leaf_value: [T,L] or [T,L,C]
+    leaf = model.leaf_value
+    if leaf.ndim == 2:
+        y_t = (probs * leaf[None, :, :]).sum(dim=2)  # [1,T]
+        return y_t[0]
+    # multiclass
+    c = int(class_idx)
+    c = max(0, min(c, leaf.shape[-1] - 1))
+    y_t = torch.einsum("btl,tl->bt", probs, leaf[:, :, c])  # [1,T]
+    return y_t[0]
+
+
 # ===== Public API =====
+
 def global_rules_df(
     model: Any,
     feature_names: Sequence[str],
     scaler: Optional[Any] = None,
     top_rules: int = 10,
     readability: Readability = "clinical",
-    **kwargs
-) -> pd.DataFrame:
-    """
-    Extract global rules from zoo_v2 models ranked by importance.
-    
-    Parameters
-    ----------
-    model : Any
-        Trained Nous zoo_v2 model
-    feature_names : Sequence[str]
-        Original feature names (before OHE expansion)
-    scaler : Optional[Any]
-        Scaler used during training (e.g., StandardScaler) to unscale thresholds
-    top_rules : int
-        Number of top rules to return
-    readability : Readability
-        Readability mode: "exact", "pretty", "simplified", or "clinical"
-    **kwargs : dict
-        Model-specific parameters (e.g., top_feats for evidence models)
-    
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns: rule_idx, weight, rule_text, direction
-    """
-    # Determine model family and dispatch to appropriate extractor
-    model_type = type(model).__name__
-    
-    # Evidence family
-    if isinstance(model, (
-        EvidenceNet, MarginEvidenceNet, PerFeatureKappaEvidenceNet,
-        BiEvidenceNet, LadderEvidenceNet, EvidenceKofNNet
-    )):
-        rules = _extract_evidence_rules(
-            model, feature_names, scaler, readability,
-            top_feats=kwargs.get('top_feats', 4)
-        )
-    
-    # Forest family
-    elif isinstance(model, (
-        PredicateForest, ObliviousForest, LeafLinearForest, AttentiveForest,
-        MultiResForest, GroupFirstForest, BudgetedForest
-    )):
-        rules = _extract_forest_rules(
-            model, feature_names, scaler, readability,
-            n_trees=kwargs.get('n_trees', min(6, top_rules))
-        )
-    
-    # Corner family (simplified - treat as evidence-like)
-    elif isinstance(model, (
-        CornerNet, SoftMinCornerNet, KofNCornerNet, RingCornerNet, HybridCornerIntervalNet
-    )):
-        # Reuse evidence extractor with adapted parameters
-        rules = _extract_evidence_rules(
-            model, feature_names, scaler, readability,
-            top_feats=kwargs.get('top_feats', 4)
-        )
-    
-    # Group evidence models (simplified extraction)
-    elif isinstance(model, (
-        GroupEvidenceKofNNet, SoftGroupEvidenceKofNNet, GroupSoftMinNet,
-        GroupContrastNet, GroupRingNet
-    )):
-        # Extract as evidence rules but note group structure in metadata
-        rules = _extract_evidence_rules(
-            model, feature_names, scaler, readability,
-            top_feats=kwargs.get('top_feats', 4)
-        )
-        # Add group metadata if available
-        if hasattr(model, 'gi') and hasattr(model.gi, 'groups'):
-            for r in rules:
-                r['groups'] = model.gi.groups
-    
-    # RegimeRulesNet (extract regime conditions + top rules)
-    elif isinstance(model, RegimeRulesNet):
-        # Extract regime conditions
-        if hasattr(model, 'th_r'):
-            regimes = []
-            th_r = model.th_r.detach().cpu().numpy()
-            K, D = th_r.shape
-            
-            for k in range(min(K, top_rules)):
-                # Simplified regime condition extraction
-                regimes.append({
-                    'regime_idx': k,
-                    'condition': f"Regime {k} (prior={float(torch.softmax(model.regime_prior, dim=0)[k]):.3f})",
-                    'weight': float(torch.softmax(model.regime_prior, dim=0)[k])
-                })
-            return pd.DataFrame(regimes)
-        return pd.DataFrame()
-    
-    # Fallback: threshold facts only
-    else:
-        facts = _extract_threshold_facts(model, feature_names, scaler, readability)
-        if facts:
-            return pd.DataFrame([{
-                'fact_idx': f['fact_idx'],
-                'rule_text': render_rule(
-                    f['clauses'],
-                    readability,
-                    ohe_groups={},
-                    base_order=_compute_base_order(list(feature_names))
-                ),
-                'weight': 1.0,  # placeholder
-                'direction': 'unknown'
-            } for f in facts[:top_rules]])
-        return pd.DataFrame(columns=['rule_idx', 'weight', 'rule_text', 'direction'])
-    
-    # Convert rules to DataFrame
-    if not rules:
-        return pd.DataFrame(columns=['rule_idx', 'weight', 'rule_text', 'direction'])
-    
-    # Build rule texts with proper metadata
+    X_ref: Optional[np.ndarray] = None,
+    class_idx: Optional[int] = None,
+    **kwargs: Any,
+):
+    """Extract global rules from zoo_v2 models ranked by importance."""
+    if pd is None:  # pragma: no cover
+        raise ImportError("pandas is required for global_rules_df()")
+
+    C = _classes()
     base_order = _compute_base_order(list(feature_names))
-    is_bin = _feature_is_binary(np.zeros((1, len(feature_names))))  # placeholder
+
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
     ohe_groups = _build_ohe_groups(list(feature_names), is_bin)
-    
-    rows = []
-    for r in rules[:top_rules]:
-        rule_text = render_rule(
-            r['clauses'],
-            readability,
-            ohe_groups=ohe_groups,
-            base_order=base_order
+
+    # Evidence family
+    if isinstance(
+        model,
+        (
+            C["EvidenceNet"],
+            C["MarginEvidenceNet"],
+            C["PerFeatureKappaEvidenceNet"],
+            C["LadderEvidenceNet"],
+            C["BiEvidenceNet"],
+            C["EvidenceKofNNet"],
+        ),
+    ):
+        rules = _extract_evidence_rules(
+            model,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            top_feats=int(kwargs.get("top_feats", 4)),
+            X_ref=X_ref,
+            class_idx=class_idx,
         )
-        rows.append({
-            'rule_idx': r.get('rule_idx', r.get('tree_idx', -1)),
-            'weight': r.get('weight', r.get('leaf_score', 0.0)),
-            'rule_text': rule_text,
-            'direction': r.get('direction', 'unknown')
-        })
-    
-    return pd.DataFrame(rows)
+        rows = []
+        for r in rules[: int(top_rules)]:
+            rows.append(
+                {
+                    "rule_idx": r["rule_idx"],
+                    "weight": r["weight"],
+                    "rule_text": render_rule(r["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": r["direction"],
+                }
+            )
+        return pd.DataFrame(rows)
+
+    # Corner family
+    if isinstance(
+        model,
+        (
+            C["CornerNet"],
+            C["SoftMinCornerNet"],
+            C["KofNCornerNet"],
+            C["RingCornerNet"],
+            C["HybridCornerIntervalNet"],
+        ),
+    ):
+        rules = _extract_corner_rules(
+            model,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            top_feats=int(kwargs.get("top_feats", 4)),
+            X_ref=X_ref,
+            class_idx=class_idx,
+        )
+        rows = []
+        for r in rules[: int(top_rules)]:
+            rows.append(
+                {
+                    "rule_idx": r["rule_idx"],
+                    "weight": r["weight"],
+                    "rule_text": render_rule(r["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": r["direction"],
+                }
+            )
+        return pd.DataFrame(rows)
+
+    # Forest family
+    if isinstance(
+        model,
+        (
+            C["PredicateForest"],
+            C["ObliviousForest"],
+            C["LeafLinearForest"],
+            C["AttentiveForest"],
+            C["MultiResForest"],
+            C["GroupFirstForest"],
+            C["BudgetedForest"],
+        ),
+    ):
+        rules = _extract_forest_rules(
+            model,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            n_trees=int(kwargs.get("n_trees", min(6, int(top_rules)))),
+            X_ref=X_ref,
+        )
+        rows = []
+        for r in rules[: int(top_rules)]:
+            rows.append(
+                {
+                    "rule_idx": r.get("tree_idx", -1),
+                    "weight": r.get("leaf_score", 0.0),
+                    "rule_text": render_rule(r["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": r.get("direction", "unknown"),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    # ScorecardWithRules: expose correction rules globally (fallback to evidence extraction on .rules if possible)
+    if isinstance(model, C["ScorecardWithRules"]) and hasattr(model, "rules"):
+        # SignedEvidenceRuleLayer is internal; easiest is to synthesize an evidence-like view with its parameters
+        # by temporarily treating model.rules as "model-like".
+        rules_layer = model.rules
+        # fabricate an adapter with .th/.ineq_sign_param/.e_sign_param/.mask_logit/.log_kappa/.t/.beta
+        adapter = type("EvidenceAdapter", (), {})()
+        adapter.th = rules_layer.th
+        adapter.ineq_sign_param = rules_layer.ineq_sign_param
+        adapter.e_sign_param = rules_layer.e_sign_param
+        adapter.mask_logit = rules_layer.mask_logit
+        adapter.log_kappa = rules_layer.log_kappa
+        adapter.t = rules_layer.t
+        adapter.beta = getattr(rules_layer, "beta", 6.0)
+        adapter.head = model  # not used; we’ll skip weights
+        # use v/priority instead? For now: show as unweighted rule library.
+        facts = _extract_evidence_rules(
+            adapter,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            top_feats=int(kwargs.get("top_feats", 4)),
+            X_ref=X_ref,
+            class_idx=class_idx,
+        )
+        rows = []
+        for rr in facts[: int(top_rules)]:
+            rows.append(
+                {
+                    "rule_idx": rr["rule_idx"],
+                    "weight": 0.0,
+                    "rule_text": render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": "unknown",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    # Fallback: threshold facts (not weighted)
+    facts = _extract_threshold_facts(model, feature_names, scaler=scaler, readability=readability, X_ref=X_ref)
+    if facts:
+        rows = []
+        for f in facts[: int(top_rules)]:
+            rows.append(
+                {
+                    "rule_idx": f.get("fact_idx", -1),
+                    "weight": 1.0,
+                    "rule_text": render_rule(f["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": "unknown",
+                }
+            )
+        return pd.DataFrame(rows)
+
+    return pd.DataFrame(columns=["rule_idx", "weight", "rule_text", "direction"])
+
 
 def local_contrib_df(
     model: Any,
@@ -766,257 +1389,255 @@ def local_contrib_df(
     scaler: Optional[Any] = None,
     top_rules: int = 10,
     readability: Readability = "clinical",
-    **kwargs
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """
-    Compute local rule contributions for a single sample.
-    
-    Parameters
-    ----------
-    model : Any
-        Trained Nous zoo_v2 model
-    x : np.ndarray
-        Single sample (1D array) in original feature space
-    feature_names : Sequence[str]
-        Original feature names
-    scaler : Optional[Any]
-        Scaler used during training
-    top_rules : int
-        Number of top contributing rules to return
-    readability : Readability
-        Readability mode for rule rendering
-    **kwargs : dict
-        Additional parameters for model-specific interpretation
-    
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with rule contributions
-    Dict[str, float]
-        Metadata including prediction probability/logit
-    """
-    # Ensure x is 2D for model inference
-    x_2d = x.reshape(1, -1).astype(np.float32)
-    
-    # Preprocess with scaler if provided
+    X_ref: Optional[np.ndarray] = None,
+    **kwargs: Any,
+):
+    """Compute local rule/tree contributions for a single sample."""
+    if pd is None:  # pragma: no cover
+        raise ImportError("pandas is required for local_contrib_df()")
+
+    x = np.asarray(x, dtype=np.float32).reshape(1, -1)
     if scaler is not None:
-        x_scaled = scaler.transform(x_2d).astype(np.float32)
+        x_scaled = np.asarray(scaler.transform(x), dtype=np.float32)
     else:
-        x_scaled = x_2d
-    
-    # Get model prediction
-    model.eval()
-    with torch.no_grad():
-        x_tensor = torch.tensor(x_scaled, device=next(model.parameters()).device)
-        logits = model(x_tensor).cpu().numpy().ravel()
-    
-    # For classification, compute probability
-    if len(logits) == 1 or (hasattr(model, 'output_dim') and model.output_dim == 1):
-        prob = 1.0 / (1.0 + np.exp(-logits[0]))
-    else:
-        # Multiclass
-        logits_stable = logits - np.max(logits)
-        exp_logits = np.exp(logits_stable)
-        prob = exp_logits / np.sum(exp_logits)
-        prob = prob[np.argmax(prob)]  # Probability of predicted class
-    
-    meta = {
-        'logit': float(logits[0]) if len(logits) == 1 else float(np.max(logits)),
-        'prob': float(prob),
-        'prediction': int(np.argmax(logits)) if len(logits) > 1 else int(logits[0] > 0)
-    }
-    
-    # Model-specific contribution extraction
-    model_type = type(model).__name__
-    
-    # Evidence family - reuse notebook logic adapted for library
-    if isinstance(model, (
-        EvidenceNet, MarginEvidenceNet, PerFeatureKappaEvidenceNet, BiEvidenceNet
-    )):
-        # Simplified version of notebook's rule_contrib_for_row_evidence_like
+        x_scaled = x
+
+    logits = _predict_logits(model, x_scaled)
+    meta = _compute_meta_from_logits(logits)
+    class_idx = int(meta["class_idx"])
+
+    # build rendering metadata
+    base_order = _compute_base_order(list(feature_names))
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _feature_is_binary(x) if x.shape[0] > 0 else _is_binary_fallback_from_names(feature_names)
+    ohe_groups = _build_ohe_groups(list(feature_names), is_bin)
+
+    C = _classes()
+    device = _device_of(model)
+    xt = torch.tensor(x_scaled, dtype=torch.float32, device=device)
+
+    # Evidence family (true local contributions)
+    if isinstance(
+        model,
+        (
+            C["EvidenceNet"],
+            C["MarginEvidenceNet"],
+            C["PerFeatureKappaEvidenceNet"],
+            C["LadderEvidenceNet"],
+            C["BiEvidenceNet"],
+            C["EvidenceKofNNet"],
+        ),
+    ):
         with torch.no_grad():
-            x_tensor = torch.tensor(x_scaled, device=next(model.parameters()).device)
-            w = model.head.weight[0]
-            
-            if isinstance(model, BiEvidenceNet):
-                # BiEvidenceNet-specific computation
-                width = torch.exp(model.log_kappa).clamp(1e-3, 50.0)
-                t_low = model.center - 0.5 * width
-                t_high = model.center + 0.5 * width
-                kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
-                low = torch.sigmoid(kappa * (t_low[None, :, :] - x_tensor[:, None, :]))
-                high = torch.sigmoid(kappa * (x_tensor[:, None, :] - t_high[None, :, :]))
-                mask = torch.sigmoid(model.mask)[None, :, :]
-                el = torch.tanh(model.e_low)[None, :, :]
-                eh = torch.tanh(model.e_high)[None, :, :]
-                evidence = (mask * (el * (2.0 * low - 1.0) + eh * (2.0 * high - 1.0))).sum(dim=2)
-                z = torch.sigmoid(model.beta * (evidence - model.t[None, :]))[0]
-                contrib = (z * w).detach().cpu().numpy()
+            z = _evidence_like_rule_activations(model, xt)  # [R]
+            W = model.head.weight  # [C,R] or [1,R]
+            if W.ndim == 2:
+                w = W[class_idx]
             else:
-                # Standard evidence models
-                kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
-                ineq = torch.tanh(model.ineq_sign_param)
-                c = torch.sigmoid(kappa * ineq[None, :, :] * (x_tensor[:, None, :] - model.th[None, :, :]))
-                mask = torch.sigmoid(model.mask_logit)[None, :, :]
-                es = torch.tanh(model.e_sign_param)[None, :, :]
-                evidence = (mask * es * (2.0 * c - 1.0)).sum(dim=2)
-                z = torch.sigmoid(model.beta * (evidence - model.t[None, :]))[0]
-                contrib = (z * w).detach().cpu().numpy()
-        
-        # Get global rules for rendering
-        global_rules = _extract_evidence_rules(model, feature_names, scaler, readability, top_feats=4)
-        
-        # Build contribution DataFrame
+                w = W
+            contrib = (z * w).detach().cpu().numpy()
+
+        global_rules = _extract_evidence_rules(
+            model,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            top_feats=int(kwargs.get("top_feats", 4)),
+            X_ref=X_ref,
+            class_idx=class_idx,
+        )
+
+        idxs = np.argsort(-np.abs(contrib))[: int(top_rules)]
         rows = []
-        for i in np.argsort(-np.abs(contrib))[:top_rules]:
+        for i in idxs:
             r = int(i)
             if r >= len(global_rules):
                 continue
-            
-            rule_info = global_rules[r]
-            rows.append({
-                'rule_idx': r,
-                'contribution': float(contrib[r]),
-                'activation': float(z[r].item() if 'z' in locals() else 0.0),
-                'weight': float(w[r].item() if hasattr(w, 'item') else w[r]),
-                'rule_text': render_rule(
-                    rule_info['clauses'],
-                    readability,
-                    ohe_groups=_build_ohe_groups(list(feature_names), _feature_is_binary(x_2d)),
-                    base_order=_compute_base_order(list(feature_names))
-                ),
-                'direction': 'increases' if contrib[r] > 0 else 'decreases'
-            })
-        
+            rr = global_rules[r]
+            rows.append(
+                {
+                    "rule_idx": r,
+                    "contribution": float(contrib[r]),
+                    "activation": float(z[r].detach().cpu().item()),
+                    "weight": float(w[r].detach().cpu().item()),
+                    "rule_text": render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": "increases" if contrib[r] > 0 else "decreases",
+                }
+            )
         return pd.DataFrame(rows), meta
-    
-    # Forest models - simplified tree contribution
-    elif isinstance(model, (
-        PredicateForest, ObliviousForest, LeafLinearForest, AttentiveForest,
-        MultiResForest, GroupFirstForest, BudgetedForest
-    )):
-        # Get tree contributions (simplified)
-        with torch.no_grad():
-            x_tensor = torch.tensor(x_scaled, device=next(model.parameters()).device)
-            f = model.facts(x_tensor) if hasattr(model, 'facts') else x_tensor
-            f_aug = torch.cat([f, 1.0 - f], dim=1) if hasattr(model, 'facts') else f
-            
-            # Get tree outputs
-            if hasattr(model, 'leaf_value'):
-                # Simplified tree contribution via leaf values
-                tree_out = model.leaf_value.detach().cpu().numpy().sum(axis=1)
-                tree_contrib = tree_out[:top_rules]
-                
-                # Get global rules for rendering
-                global_rules = _extract_forest_rules(model, feature_names, scaler, readability, n_trees=top_rules)
-                
-                rows = []
-                for i, r in enumerate(np.argsort(-np.abs(tree_contrib))[:top_rules]):
-                    if r >= len(global_rules):
-                        continue
-                    
-                    rule_info = global_rules[r]
-                    rows.append({
-                        'tree_idx': r,
-                        'contribution': float(tree_contrib[r]),
-                        'tree_score': float(rule_info['leaf_score']),
-                        'rule_text': render_rule(
-                            rule_info['clauses'],
-                            readability,
-                            ohe_groups=_build_ohe_groups(list(feature_names), _feature_is_binary(x_2d)),
-                            base_order=_compute_base_order(list(feature_names))
-                        ),
-                        'direction': 'increases' if tree_contrib[r] > 0 else 'decreases'
-                    })
-                
-                return pd.DataFrame(rows), meta
-        
-        # Fallback for forests without direct tree output access
-        global_rules = _extract_forest_rules(model, feature_names, scaler, readability, n_trees=top_rules)
-        rows = [{
-            'tree_idx': i,
-            'contribution': 0.0,  # placeholder
-            'tree_score': r['leaf_score'],
-            'rule_text': render_rule(
-                r['clauses'],
-                readability,
-                ohe_groups=_build_ohe_groups(list(feature_names), _feature_is_binary(x_2d)),
-                base_order=_compute_base_order(list(feature_names))
-            ),
-            'direction': r['direction']
-        } for i, r in enumerate(global_rules[:top_rules])]
-        
-        return pd.DataFrame(rows), meta
-    
-    # Fallback: global rules with zero contributions
-    global_rules = global_rules_df(
-        model, feature_names, scaler, top_rules, readability, **kwargs
-    )
-    
-    if len(global_rules) == 0:
-        return pd.DataFrame(columns=[
-            'rule_idx', 'contribution', 'activation', 'weight', 'rule_text', 'direction'
-        ]), meta
-    
-    # Add contribution column with zeros as placeholder
-    global_rules['contribution'] = 0.0
-    global_rules['activation'] = 0.0
-    global_rules = global_rules[[
-        'rule_idx', 'contribution', 'activation', 'weight', 'rule_text', 'direction'
-    ]]
-    
-    return global_rules.head(top_rules), meta
 
-# ===== Convenience functions =====
+    # Corner family (true local contributions)
+    if isinstance(
+        model,
+        (
+            C["CornerNet"],
+            C["SoftMinCornerNet"],
+            C["KofNCornerNet"],
+            C["RingCornerNet"],
+            C["HybridCornerIntervalNet"],
+        ),
+    ):
+        with torch.no_grad():
+            z = _corner_like_rule_activations(model, xt)  # [R]
+            W = model.head.weight
+            if W.ndim == 2:
+                w = W[class_idx]
+            else:
+                w = W
+            contrib = (z * w).detach().cpu().numpy()
+
+        global_rules = _extract_corner_rules(
+            model,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            top_feats=int(kwargs.get("top_feats", 4)),
+            X_ref=X_ref,
+            class_idx=class_idx,
+        )
+
+        idxs = np.argsort(-np.abs(contrib))[: int(top_rules)]
+        rows = []
+        for i in idxs:
+            r = int(i)
+            if r >= len(global_rules):
+                continue
+            rr = global_rules[r]
+            rows.append(
+                {
+                    "rule_idx": r,
+                    "contribution": float(contrib[r]),
+                    "activation": float(z[r].detach().cpu().item()),
+                    "weight": float(w[r].detach().cpu().item()),
+                    "rule_text": render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": "increases" if contrib[r] > 0 else "decreases",
+                }
+            )
+        return pd.DataFrame(rows), meta
+
+    # Forest family (tree contributions)
+    if isinstance(
+        model,
+        (
+            C["PredicateForest"],
+            C["ObliviousForest"],
+            C["LeafLinearForest"],
+            C["AttentiveForest"],
+            C["MultiResForest"],
+            C["GroupFirstForest"],
+            C["BudgetedForest"],
+        ),
+    ):
+        with torch.no_grad():
+            y_t = _forest_tree_outputs(model, xt, class_idx=class_idx)  # [T]
+
+            # AttentiveForest: apply attention weights as contribution scaling
+            if isinstance(model, C["AttentiveForest"]):
+                f = model.facts(xt)
+                f_aug = torch.cat([f, 1.0 - f], dim=1)
+                a_logits = model.att(f_aug)  # [1,T]
+                selector = str(getattr(model, "selector", "sparsemax"))
+                a = _sel_probs(a_logits, selector=selector, tau=float(getattr(model, "tau_select", 0.7)), dim=1)[0]  # [T]
+                contrib_t = (a * y_t).detach().cpu().numpy()
+            else:
+                contrib_t = y_t.detach().cpu().numpy()
+
+        global_rules = _extract_forest_rules(
+            model,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            n_trees=int(min(int(top_rules), int(getattr(model, "T", len(contrib_t))))),
+            X_ref=X_ref,
+        )
+
+        idxs = np.argsort(-np.abs(contrib_t))[: int(top_rules)]
+        rows = []
+        for i in idxs:
+            t = int(i)
+            # find matching global rule for that tree if available
+            rr = next((g for g in global_rules if int(g.get("tree_idx", -1)) == t), None)
+            rule_text = ""
+            leaf_score = float("nan")
+            direction = "unknown"
+            if rr is not None:
+                rule_text = render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order)
+                leaf_score = float(rr.get("leaf_score", float("nan")))
+                direction = rr.get("direction", "unknown")
+
+            rows.append(
+                {
+                    "tree_idx": t,
+                    "contribution": float(contrib_t[t]),
+                    "tree_output": float(y_t[t].detach().cpu().item()),
+                    "leaf_score": leaf_score,
+                    "rule_text": rule_text,
+                    "direction": direction,
+                }
+            )
+        return pd.DataFrame(rows), meta
+
+    # Fallback: return global rules with zero contributions
+    df = global_rules_df(
+        model,
+        feature_names,
+        scaler=scaler,
+        top_rules=top_rules,
+        readability=readability,
+        X_ref=X_ref,
+        **kwargs,
+    )
+    if len(df) == 0:
+        return (
+            pd.DataFrame(columns=["rule_idx", "contribution", "activation", "weight", "rule_text", "direction"]),
+            meta,
+        )
+    df = df.copy()
+    df["contribution"] = 0.0
+    df["activation"] = 0.0
+    df = df[["rule_idx", "contribution", "activation", "weight", "rule_text", "direction"]]
+    return df.head(int(top_rules)), meta
+
+
 def explain_prediction(
     model: Any,
     x: np.ndarray,
     feature_names: Sequence[str],
     scaler: Optional[Any] = None,
     readability: Readability = "clinical",
-    top_rules: int = 5
+    top_rules: int = 5,
+    X_ref: Optional[np.ndarray] = None,
 ) -> str:
-    """
-    Generate human-readable explanation for a single prediction.
-    
-    Parameters
-    ----------
-    model : Any
-        Trained Nous zoo_v2 model
-    x : np.ndarray
-        Single sample (1D array)
-    feature_names : Sequence[str]
-        Feature names
-    scaler : Optional[Any]
-        Feature scaler used during training
-    readability : Readability
-        Readability mode
-    top_rules : int
-        Number of top rules to include in explanation
-    
-    Returns
-    -------
-    str
-        Human-readable explanation text
-    """
+    """Generate a human-readable explanation for a single prediction."""
     contrib_df, meta = local_contrib_df(
-        model, x, feature_names, scaler, top_rules, readability
+        model,
+        x,
+        feature_names,
+        scaler=scaler,
+        top_rules=top_rules,
+        readability=readability,
+        X_ref=X_ref,
     )
-    
-    lines = []
+
+    lines: List[str] = []
     lines.append(f"Prediction: {meta['prediction']} (probability: {meta['prob']:.3f})")
     lines.append(f"Logit: {meta['logit']:+.3f}")
     lines.append("-" * 60)
-    lines.append(f"Top {min(top_rules, len(contrib_df))} contributing rules:")
-    
-    for idx, row in contrib_df.head(top_rules).iterrows():
-        direction = "↑ increases" if row['direction'] == 'increases' else "↓ decreases"
-        contrib = row['contribution']
-        rule_text = row['rule_text']
-        lines.append(f"\n{direction} ({contrib:+.3f}):")
-        lines.append(f"  IF {rule_text}")
-    
+
+    if "rule_idx" in contrib_df.columns:
+        lines.append(f"Top {min(int(top_rules), len(contrib_df))} contributing rules:")
+        for _, row in contrib_df.head(int(top_rules)).iterrows():
+            direction = "increases" if row.get("direction", "unknown") == "increases" else "decreases"
+            lines.append(f"\n{direction} ({float(row.get('contribution', 0.0)):+.3f}):")
+            lines.append(f"  IF {row.get('rule_text', '')}")
+    else:
+        lines.append(f"Top {min(int(top_rules), len(contrib_df))} contributing trees:")
+        for _, row in contrib_df.head(int(top_rules)).iterrows():
+            direction = row.get("direction", "unknown")
+            lines.append(f"\n{direction} ({float(row.get('contribution', 0.0)):+.3f}):")
+            lines.append(f"  IF {row.get('rule_text', '')}")
+
     return "\n".join(lines)
+
 
 def export_global_rules(
     model: Any,
@@ -1025,59 +1646,66 @@ def export_global_rules(
     scaler: Optional[Any] = None,
     top_rules: int = 20,
     readability: Readability = "clinical",
-    format: Literal["txt", "json", "csv"] = "txt"
+    format: Literal["txt", "json", "csv"] = "txt",
+    X_ref: Optional[np.ndarray] = None,
+    **kwargs: Any,
 ) -> None:
-    """
-    Export global rules to file in specified format.
-    
-    Parameters
-    ----------
-    model : Any
-        Trained Nous zoo_v2 model
-    feature_names : Sequence[str]
-        Feature names
-    path : str
-        Output file path
-    scaler : Optional[Any]
-        Feature scaler
-    top_rules : int
-        Number of top rules to export
-    readability : Readability
-        Readability mode for rule text
-    format : Literal["txt", "json", "csv"]
-        Output format
-    """
-    df = global_rules_df(model, feature_names, scaler, top_rules, readability)
-    
-    import os
+    """Export global rules to file."""
+    if pd is None:  # pragma: no cover
+        raise ImportError("pandas is required for export_global_rules()")
+
+    df = global_rules_df(
+        model,
+        feature_names,
+        scaler=scaler,
+        top_rules=top_rules,
+        readability=readability,
+        X_ref=X_ref,
+        **kwargs,
+    )
+
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    
+
     if format == "txt":
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(f"Global rules for {type(model).__name__}\n")
             f.write("=" * 60 + "\n\n")
-            for idx, row in df.iterrows():
-                f.write(f"Rule {row['rule_idx']} ({row['direction']} prediction):\n")
-                f.write(f"  Weight: {row['weight']:+.3f}\n")
+            for _, row in df.iterrows():
+                f.write(f"Rule {int(row['rule_idx'])} ({row['direction']} prediction):\n")
+                f.write(f"  Weight: {float(row['weight']):+,.6f}\n")
                 f.write(f"  IF {row['rule_text']}\n\n")
-    
+
     elif format == "json":
         import json
+
         rules = []
-        for idx, row in df.iterrows():
-            rules.append({
-                "rule_idx": int(row["rule_idx"]),
-                "weight": float(row["weight"]),
-                "rule_text": row["rule_text"],
-                "direction": row["direction"]
-            })
-        
-        with open(path, "w") as f:
-            json.dump({
-                "model": type(model).__name__,
-                "readability": readability,
-                "rules": rules
-            }, f, indent=2)
-    
+        for _, row in df.iterrows():
+            rules.append(
+                {
+                    "rule_idx": int(row["rule_idx"]),
+                    "weight": float(row["weight"]),
+                    "rule_text": str(row["rule_text"]),
+                    "direction": str(row["direction"]),
+                }
+            )
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"model": type(model).__name__, "readability": readability, "rules": rules},
+                f,
+                indent=2,
+            )
+
     elif format == "csv":
         df.to_csv(path, index=False)
+    else:
+        raise ValueError(f"Unknown format: {format}")
+
+
+__all__ = [
+    "Clause",
+    "SimplifiedCondition",
+    "global_rules_df",
+    "local_contrib_df",
+    "explain_prediction",
+    "export_global_rules",
+]
