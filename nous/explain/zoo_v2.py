@@ -442,30 +442,138 @@ def _get_threshold_fact_bank(model: Any) -> Optional[Any]:
     return None
 
 
+def _infer_n_thresh_per_feat(fb: Any, D: int) -> Optional[int]:
+    """
+    Infer thresholds-per-feature K for axis threshold fact banks.
+
+    Supports:
+    - fb.n_thresh_per_feat
+    - fb.K
+    - fb.num_facts / D
+    - len(fb.th) / D when th is 1D
+    """
+    # explicit attrs
+    for attr in ("n_thresh_per_feat", "K"):
+        if hasattr(fb, attr):
+            try:
+                K = int(getattr(fb, attr))
+                if K > 0:
+                    return K
+            except Exception:
+                pass
+
+    # from num_facts
+    if hasattr(fb, "num_facts"):
+        try:
+            F0 = int(getattr(fb, "num_facts"))
+            if D > 0 and F0 % D == 0:
+                K = int(F0 // D)
+                if K > 0:
+                    return K
+        except Exception:
+            pass
+
+    # from th length if 1D
+    if hasattr(fb, "th"):
+        th = getattr(fb, "th")
+        try:
+            if isinstance(th, torch.Tensor) and th.ndim == 1:
+                n = int(th.numel())
+                if D > 0 and n % D == 0:
+                    K = int(n // D)
+                    if K > 0:
+                        return K
+            arr = np.asarray(th)
+            if arr.ndim == 1:
+                n = int(arr.size)
+                if D > 0 and n % D == 0:
+                    K = int(n // D)
+                    if K > 0:
+                        return K
+        except Exception:
+            pass
+
+    return None
+
+
 def _threshold_layout_from_factbank(fb: Any, D: int) -> Optional[Tuple[int, int]]:
-    """Infer (D,K) for axis threshold banks where facts are D*K."""
+    """Infer (D,K) for axis threshold banks where facts are D*K.
+
+    Handles both:
+    - th shaped [D,K]
+    - th shaped [D*K] (flattened)
+    """
     if hasattr(fb, "th"):
         th = fb.th
-        if isinstance(th, torch.Tensor):
-            shp = tuple(th.shape)
-        else:
-            shp = tuple(np.asarray(th).shape)
+        shp = tuple(th.shape) if isinstance(th, torch.Tensor) else tuple(np.asarray(th).shape)
+
+        # canonical [D,K]
         if len(shp) == 2 and shp[0] == D:
             return D, int(shp[1])
+
+        # flattened [D*K]
+        if len(shp) == 1:
+            K = _infer_n_thresh_per_feat(fb, D)
+            if K is not None:
+                return D, int(K)
+
     # fallback from num_facts
     if hasattr(fb, "num_facts"):
         F0 = int(getattr(fb, "num_facts"))
         if D > 0 and F0 % D == 0:
             return D, int(F0 // D)
+
     return None
 
 
-def _axis_threshold_value(fb: Any, j: int, k: int) -> float:
-    """Get threshold value from axis threshold fact bank."""
+def _axis_threshold_value(fb: Any, j: int, k: int, D: Optional[int] = None) -> float:
+    """Get threshold value from axis threshold fact bank.
+
+    Supports:
+    - th as [D,K]
+    - th as flattened [D*K] in feature-major contiguous order
+    """
     th = fb.th
+
+    def _infer_D() -> int:
+        if D is not None and int(D) > 0:
+            return int(D)
+        for attr in ("input_dim", "D", "d_in", "n_features"):
+            if hasattr(fb, attr):
+                try:
+                    v = int(getattr(fb, attr))
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+        return 0
+
+    # torch path
     if isinstance(th, torch.Tensor):
-        return float(th[j, k].detach().cpu().item())
-    return float(np.asarray(th)[j, k])
+        if th.ndim == 2:
+            return float(th[int(j), int(k)].detach().cpu().item())
+        if th.ndim == 1:
+            D0 = _infer_D()
+            D_guess = D0 if D0 > 0 else max(int(j) + 1, 1)
+            K = _infer_n_thresh_per_feat(fb, D_guess) or 1
+            idx = int(j) * int(K) + int(k)
+            idx = max(0, min(idx, int(th.numel()) - 1))
+            return float(th[idx].detach().cpu().item())
+        return float("nan")
+
+    # numpy path
+    arr = np.asarray(th)
+    if arr.ndim == 2:
+        return float(arr[int(j), int(k)])
+    if arr.ndim == 1:
+        D0 = _infer_D()
+        D_guess = D0 if D0 > 0 else max(int(j) + 1, 1)
+        K = _infer_n_thresh_per_feat(fb, D_guess) or 1
+        idx = int(j) * int(K) + int(k)
+        idx = max(0, min(idx, int(arr.size) - 1))
+        return float(arr[idx])
+
+    return float("nan")
 
 
 def _extract_threshold_facts(
@@ -558,7 +666,7 @@ def _extract_threshold_facts(
             sp = _split_ohe(raw_feat)
             base = sp[0] if sp else raw_feat
             for k in range(K):
-                thr_u = _unscale_value(j, _axis_threshold_value(facts, j, k), scaler)
+                thr_u = _unscale_value(j, _axis_threshold_value(facts, j, k, D=D), scaler)
                 # If OHE binary, map ">= threshold" into ==/!= semantics is not robust globally.
                 # Keep numeric representation unless it clearly looks OHE-binary.
                 if bool(is_bin[j]) and sp is not None:
@@ -754,6 +862,7 @@ def _extract_evidence_rules(
             }
         )
 
+    # NOTE: sorted for global display; local_contrib_df should map by rule_idx (not list position).
     rules.sort(key=lambda rr: abs(rr["weight"]), reverse=True)
     return rules
 
@@ -852,6 +961,7 @@ def _extract_corner_rules(
             }
         )
 
+    # NOTE: sorted for global display; local_contrib_df should map by rule_idx (not list position).
     rules.sort(key=lambda rr: abs(rr["weight"]), reverse=True)
     return rules
 
@@ -890,7 +1000,7 @@ def _decode_fact_index_to_jk(
     _, K = layout
     j = int(base_idx // K)
     k = int(base_idx % K)
-    thr = _axis_threshold_value(facts, j, k)
+    thr = _axis_threshold_value(facts, j, k, D=D)
     return j, k, float(thr)
 
 
@@ -971,7 +1081,6 @@ def _extract_forest_rules(
             # - if selector chooses f (x>=thr), literal true => x>=thr
             # - if selector chooses (1-f) (x<thr), literal true => x<=thr
             # leaf bit=1 wants literal true, bit=0 wants literal false.
-            # So final op depends on (is_neg XOR (bit==1)) etc.
             want_literal_true = (bit == 1)
             if not is_neg:
                 # literal is f
@@ -1152,8 +1261,7 @@ def _corner_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
         zi, _, _ = corner_product_z(xt, model.th_i, model.sign_i, model.mask_i, model.log_kappa)
         return (zo * (1.0 - zi))[0]
 
-    # HybridCornerIntervalNet: use its forward pieces approximately by re-calling forward and backing out head?
-    # We *can* compute rule activations by re-implementing its z.
+    # HybridCornerIntervalNet
     if hasattr(model, "th_c") and hasattr(model, "sign_c") and hasattr(model, "center") and hasattr(model, "log_width"):
         kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
         sgn = torch.tanh(model.sign_c)
@@ -1205,6 +1313,27 @@ def _forest_tree_outputs(model: Any, xt: torch.Tensor, class_idx: int = 0) -> to
     c = max(0, min(c, leaf.shape[-1] - 1))
     y_t = torch.einsum("btl,tl->bt", probs, leaf[:, :, c])  # [1,T]
     return y_t[0]
+
+
+def _make_signed_evidence_adapter(rules_layer: Any, weight_vec: torch.Tensor) -> Any:
+    """
+    Create a lightweight object compatible with _extract_evidence_rules()
+    from a SignedEvidenceRuleLayer and a chosen head weight vector [R].
+    """
+    adapter = type("SignedEvidenceAdapter", (), {})()
+    adapter.th = rules_layer.th
+    adapter.ineq_sign_param = rules_layer.ineq_sign_param
+    adapter.e_sign_param = rules_layer.e_sign_param
+    adapter.mask_logit = rules_layer.mask_logit
+    adapter.log_kappa = rules_layer.log_kappa
+    adapter.t = rules_layer.t
+    adapter.beta = float(getattr(rules_layer, "beta", 6.0))
+
+    # fake head with weight shaped [1,R]
+    head = type("Head", (), {})()
+    head.weight = weight_vec.detach().reshape(1, -1)
+    adapter.head = head
+    return adapter
 
 
 # ===== Public API =====
@@ -1327,12 +1456,75 @@ def global_rules_df(
             )
         return pd.DataFrame(rows)
 
-    # ScorecardWithRules: expose correction rules globally (fallback to evidence extraction on .rules if possible)
+    # RegimeRulesNet (optional global view: show regime "conditions" ranked by prior)
+    if isinstance(model, (C["RegimeRulesNet"],)) and hasattr(model, "th_r") and hasattr(model, "regime_prior"):
+        try:
+            prior = model.regime_prior.detach()
+            pi0 = torch.softmax(prior, dim=0).detach().cpu().numpy()
+            K = int(pi0.shape[0])
+
+            th_r = model.th_r.detach().cpu().numpy()  # [K,D]
+            ineq_r = np.tanh(model.ineq_r.detach().cpu().numpy())  # [K,D]
+            es_r = np.tanh(model.esign_r.detach().cpu().numpy())  # [K,D]
+            mask_r = torch.sigmoid(model.mask_r).detach().cpu().numpy()  # [K,D]
+
+            top_feats_regime = int(kwargs.get("top_feats_regime", kwargs.get("top_feats", 5)))
+            order = np.argsort(-pi0)[: int(top_rules)]
+            rows = []
+            for k in order:
+                score = mask_r[k] * (0.6 + 0.4 * np.abs(es_r[k]))
+                fidx = np.argsort(-score)[:top_feats_regime]
+
+                clauses: List[Clause] = []
+                for j0 in fidx:
+                    j = int(j0)
+                    raw_feat = feature_names[j]
+                    sp = _split_ohe(raw_feat)
+                    base = sp[0] if sp else raw_feat
+
+                    op_base = ">=" if ineq_r[k, j] >= 0 else "<="
+                    op = op_base if es_r[k, j] >= 0 else ("<=" if op_base == ">=" else ">=")
+                    thr_u = _unscale_value(j, float(th_r[k, j]), scaler)
+
+                    if bool(is_bin[j]) and sp is not None:
+                        want_one = op in (">", ">=")
+                        clauses.append(
+                            Clause(
+                                base=base,
+                                kind="category",
+                                op=("==" if want_one else "!="),
+                                value=sp[1],
+                                raw_feature=raw_feat,
+                                feature_index=j,
+                            )
+                        )
+                    else:
+                        clauses.append(
+                            Clause(
+                                base=base,
+                                kind="numeric",
+                                op=op,
+                                value=float(thr_u),
+                                raw_feature=raw_feat,
+                                feature_index=j,
+                            )
+                        )
+
+                rows.append(
+                    {
+                        "rule_idx": int(k),
+                        "weight": float(pi0[int(k)]),
+                        "rule_text": render_rule(clauses, readability, ohe_groups=ohe_groups, base_order=base_order),
+                        "direction": "unknown",
+                    }
+                )
+            return pd.DataFrame(rows)
+        except Exception:
+            pass
+
+    # ScorecardWithRules: expose correction rules globally (as an unweighted library)
     if isinstance(model, C["ScorecardWithRules"]) and hasattr(model, "rules"):
-        # SignedEvidenceRuleLayer is internal; easiest is to synthesize an evidence-like view with its parameters
-        # by temporarily treating model.rules as "model-like".
         rules_layer = model.rules
-        # fabricate an adapter with .th/.ineq_sign_param/.e_sign_param/.mask_logit/.log_kappa/.t/.beta
         adapter = type("EvidenceAdapter", (), {})()
         adapter.th = rules_layer.th
         adapter.ineq_sign_param = rules_layer.ineq_sign_param
@@ -1340,9 +1532,14 @@ def global_rules_df(
         adapter.mask_logit = rules_layer.mask_logit
         adapter.log_kappa = rules_layer.log_kappa
         adapter.t = rules_layer.t
-        adapter.beta = getattr(rules_layer, "beta", 6.0)
-        adapter.head = model  # not used; we’ll skip weights
-        # use v/priority instead? For now: show as unweighted rule library.
+        adapter.beta = float(getattr(rules_layer, "beta", 6.0))
+
+        # Provide a safe dummy head weight vector (zeros), just to decode clauses.
+        R = int(rules_layer.th.shape[0])
+        head = type("Head", (), {})()
+        head.weight = torch.zeros(1, R, device=rules_layer.th.device, dtype=rules_layer.th.dtype)
+        adapter.head = head
+
         facts = _extract_evidence_rules(
             adapter,
             feature_names,
@@ -1350,7 +1547,7 @@ def global_rules_df(
             readability=readability,
             top_feats=int(kwargs.get("top_feats", 4)),
             X_ref=X_ref,
-            class_idx=class_idx,
+            class_idx=0,
         )
         rows = []
         for rr in facts[: int(top_rules)]:
@@ -1408,7 +1605,7 @@ def local_contrib_df(
 
     # build rendering metadata
     base_order = _compute_base_order(list(feature_names))
-    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _feature_is_binary(x) if x.shape[0] > 0 else _is_binary_fallback_from_names(feature_names)
+    is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
     ohe_groups = _build_ohe_groups(list(feature_names), is_bin)
 
     C = _classes()
@@ -1445,14 +1642,15 @@ def local_contrib_df(
             X_ref=X_ref,
             class_idx=class_idx,
         )
+        rule_map = {int(rr["rule_idx"]): rr for rr in global_rules}
 
         idxs = np.argsort(-np.abs(contrib))[: int(top_rules)]
         rows = []
         for i in idxs:
             r = int(i)
-            if r >= len(global_rules):
+            rr = rule_map.get(r)
+            if rr is None:
                 continue
-            rr = global_rules[r]
             rows.append(
                 {
                     "rule_idx": r,
@@ -1494,14 +1692,15 @@ def local_contrib_df(
             X_ref=X_ref,
             class_idx=class_idx,
         )
+        rule_map = {int(rr["rule_idx"]): rr for rr in global_rules}
 
         idxs = np.argsort(-np.abs(contrib))[: int(top_rules)]
         rows = []
         for i in idxs:
             r = int(i)
-            if r >= len(global_rules):
+            rr = rule_map.get(r)
+            if rr is None:
                 continue
-            rr = global_rules[r]
             rows.append(
                 {
                     "rule_idx": r,
@@ -1512,6 +1711,90 @@ def local_contrib_df(
                     "direction": "increases" if contrib[r] > 0 else "decreases",
                 }
             )
+        return pd.DataFrame(rows), meta
+
+    # RegimeRulesNet (pi-weighted rule contributions)
+    if isinstance(model, (C["RegimeRulesNet"],)):
+        if not (hasattr(model, "_regime_group_evidence") and hasattr(model, "regime_gate") and hasattr(model, "rules")):
+            df = global_rules_df(
+                model,
+                feature_names,
+                scaler=scaler,
+                top_rules=top_rules,
+                readability=readability,
+                X_ref=X_ref,
+                **kwargs,
+            )
+            df = df.copy()
+            df["contribution"] = 0.0
+            df["activation"] = 0.0
+            df = df[["rule_idx", "contribution", "activation", "weight", "rule_text", "direction"]]
+            return df.head(int(top_rules)), meta
+
+        with torch.no_grad():
+            # regime posterior pi
+            eg = model._regime_group_evidence(xt)  # [1,K,G]
+            z_reg = model.regime_gate(eg).clamp_min(1e-6)  # [1,K]
+            logits_k = model.regime_prior[None, :] + torch.log(z_reg)  # [1,K]
+            pi = torch.softmax(logits_k, dim=1)[0]  # [K]
+
+            # rule activations
+            z_rules = model.rules(xt)[0]  # [R]
+
+            # aggregate head weights under pi (avoid any incorrect sum(dim=2) patterns)
+            out_dim = int(getattr(model, "output_dim", 1) or 1)
+            if out_dim == 1:
+                # W: [K,R]
+                Wkr = model.W  # [K,R]
+                w_vec = (pi[:, None] * Wkr).sum(dim=0)  # [R]
+            else:
+                # W: [K,R,C]
+                c = int(class_idx)
+                Wkrc = model.W[:, :, c]  # [K,R]
+                w_vec = (pi[:, None] * Wkrc).sum(dim=0)  # [R]
+
+            contrib = (z_rules * w_vec).detach().cpu().numpy()
+
+        # Render rules using evidence extractor by adapting the signed rule layer
+        adapter = _make_signed_evidence_adapter(model.rules, w_vec)
+        global_rules = _extract_evidence_rules(
+            adapter,
+            feature_names,
+            scaler=scaler,
+            readability=readability,
+            top_feats=int(kwargs.get("top_feats", 4)),
+            X_ref=X_ref,
+            class_idx=0,
+        )
+        rule_map = {int(rr["rule_idx"]): rr for rr in global_rules}
+
+        idxs = np.argsort(-np.abs(contrib))[: int(top_rules)]
+        rows = []
+        for i in idxs:
+            r = int(i)
+            rr = rule_map.get(r)
+            if rr is None:
+                continue
+            rows.append(
+                {
+                    "rule_idx": r,
+                    "contribution": float(contrib[r]),
+                    "activation": float(z_rules[r].detach().cpu().item()),
+                    "weight": float(w_vec[r].detach().cpu().item()),
+                    "rule_text": render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                    "direction": "increases" if contrib[r] > 0 else "decreases",
+                }
+            )
+
+        # augment meta with top regimes
+        try:
+            pi_np = pi.detach().cpu().numpy()
+            topk = np.argsort(-pi_np)[: min(5, len(pi_np))]
+            meta = dict(meta)
+            meta["regime_pi_top"] = [(int(k), float(pi_np[k])) for k in topk]
+        except Exception:
+            pass
+
         return pd.DataFrame(rows), meta
 
     # Forest family (tree contributions)
