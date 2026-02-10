@@ -27,13 +27,12 @@ import torch
 
 try:
     import pandas as pd
-except Exception as e:  # pragma: no cover
+except Exception:  # pragma: no cover
     pd = None
 
 from ..zoo import ThresholdFactBank
 from ..zoo_v2.common import corner_product_z, safe_log, sparsemax
 from ..zoo_v2.facts import ARFactBank, IntervalFactBank, MultiResAxisFactBank
-
 
 Readability = Literal["exact", "pretty", "simplified", "clinical"]
 
@@ -103,7 +102,6 @@ def _is_binary_fallback_from_names(feature_names: Sequence[str]) -> np.ndarray:
     """Fallback binary detection when no reference data is available."""
     out = np.zeros(len(feature_names), dtype=bool)
     for j, n in enumerate(feature_names):
-        # If it looks like OHE, treat as binary.
         out[j] = _split_ohe(n) is not None
     return out
 
@@ -406,7 +404,6 @@ def _unscale_value(j: int, val_scaled: float, scaler: Optional[Any]) -> float:
         try:
             D = getattr(scaler, "n_features_in_", None)
             if D is None:
-                # fallback: try mean_/scale_ size
                 if hasattr(scaler, "mean_"):
                     D = len(scaler.mean_)
                 elif hasattr(scaler, "scale_"):
@@ -747,34 +744,39 @@ def _extract_evidence_rules(
     is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
 
     th = getattr(model, "th", None)
-    if th is None:
+    if th is None or not isinstance(th, torch.Tensor):
         return []
-    th = th.detach().cpu().numpy()  # [R,Dm]
-    R, Dm = th.shape
+    th_np = th.detach().cpu().numpy()  # [R,Dm]
+    if th_np.ndim != 2:
+        return []
+    R, Dm = th_np.shape
     D_use = min(D, Dm)
 
+    # ineq sign
     if hasattr(model, "ineq_sign_param"):
         ineq = np.tanh(model.ineq_sign_param.detach().cpu().numpy())
     elif hasattr(model, "ineq"):
         ineq = np.tanh(model.ineq.detach().cpu().numpy())
     else:
-        ineq = np.ones_like(th)
+        ineq = np.ones_like(th_np)
 
+    # evidence sign
     if hasattr(model, "e_sign_param"):
         es = np.tanh(model.e_sign_param.detach().cpu().numpy())
     elif hasattr(model, "esign"):
         es = np.tanh(model.esign.detach().cpu().numpy())
     else:
-        es = np.ones_like(th)
+        es = np.ones_like(th_np)
 
+    # mask
     if hasattr(model, "mask_logit"):
         mask = torch.sigmoid(model.mask_logit).detach().cpu().numpy()
     elif hasattr(model, "mask"):
         mask = torch.sigmoid(model.mask).detach().cpu().numpy()
     else:
-        mask = np.ones_like(th)
+        mask = np.ones_like(th_np)
 
-    if not hasattr(model, "head"):
+    if not hasattr(model, "head") or not hasattr(model.head, "weight"):
         return []
     W = model.head.weight.detach().cpu().numpy()
     if W.ndim == 1:
@@ -799,7 +801,7 @@ def _extract_evidence_rules(
             op_base = ">=" if ineq[r, j] >= 0 else "<="
             op = op_base if es[r, j] >= 0 else ("<=" if op_base == ">=" else ">=")
 
-            thr_u = _unscale_value(j, float(th[r, j]), scaler)
+            thr_u = _unscale_value(j, float(th_np[r, j]), scaler)
 
             if bool(is_bin[j]) and sp is not None:
                 want_one = op in (">", ">=")
@@ -857,6 +859,8 @@ def _extract_corner_rules(
         return []
 
     th = model.th.detach().cpu().numpy()  # [R,D]
+    if th.ndim != 2:
+        return []
     R, Dm = th.shape
     D_use = min(D, Dm)
 
@@ -1020,7 +1024,7 @@ def _extract_forest_rules(
             is_neg = f_idx >= F0
             base_idx = f_idx - F0 if is_neg else f_idx
 
-            j, k, thr_scaled = _decode_fact_index_to_jk(facts, D, base_idx)
+            j, _k, thr_scaled = _decode_fact_index_to_jk(facts, D, base_idx)
             if j < 0 or j >= D:
                 continue
 
@@ -1107,15 +1111,55 @@ def _compute_meta_from_logits(logits: np.ndarray) -> Dict[str, Any]:
     return {"logit": float(np.max(logits)), "prob": float(p[c]), "prediction": c, "class_idx": c}
 
 
+def _to_R_D_param(p: Any, R: int, D: int, like: torch.Tensor, name: str = "param") -> torch.Tensor:
+    """
+    Convert/broadcast p to shape [R,D] on like.device/like.dtype.
+
+    Accepts:
+      - scalar
+      - [R]
+      - [D]
+      - [R,D]
+      - [R,1] or [1,D]
+      - [R*D] (reshaped)
+    """
+    if not isinstance(p, torch.Tensor):
+        p = like.new_tensor(p)
+
+    p = p.to(device=like.device, dtype=like.dtype)
+
+    if p.ndim == 0:
+        return p.expand(R, D)
+
+    if p.ndim == 1:
+        n = int(p.numel())
+        if n == R:
+            return p[:, None].expand(R, D)
+        if n == D:
+            return p[None, :].expand(R, D)
+        if n == R * D:
+            return p.reshape(R, D)
+        return p.reshape(-1)[0].expand(R, D)
+
+    if p.ndim == 2:
+        if tuple(p.shape) == (R, D):
+            return p
+        if tuple(p.shape) == (R, 1):
+            return p.expand(R, D)
+        if tuple(p.shape) == (1, D):
+            return p.expand(R, D)
+        if int(p.numel()) == R * D:
+            return p.reshape(R, D)
+        return p.reshape(-1)[0].expand(R, D)
+
+    return p.reshape(-1)[0].expand(R, D)
+
+
 def _get_rule_threshold_t(model: Any, R: int, like: torch.Tensor) -> torch.Tensor:
     """
     Fetch per-rule threshold t:[R] for evidence-style gates.
 
-    Some models use:
-      - t
-      - t_e
-      - t_rule
-      - t_group
+    Some models use: t, t_e, t_rule, t_group.
     Some store scalar t; we broadcast to [R].
     """
     for attr in ("t", "t_e", "t_rule", "t_group"):
@@ -1141,8 +1185,7 @@ def _generic_evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> tor
     Best-effort rule activations z:[R] for "evidence-ish" models.
 
     Used for Group* evidence models and any future models that expose a similar
-    parameterization (th + ineq + esign + mask + optional kofN gating) but don't
-    match exact attribute patterns below.
+    parameterization (th + ineq + esign + mask + optional kofN gating).
     """
     if not hasattr(model, "th"):
         raise TypeError("Model has no .th; cannot compute evidence-like activations.")
@@ -1151,58 +1194,69 @@ def _generic_evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> tor
     if not isinstance(th, torch.Tensor) or th.ndim != 2:
         raise TypeError("Expected model.th to be a 2D torch.Tensor [R,D].")
 
-    R = int(th.shape[0])
+    R, D = int(th.shape[0]), int(th.shape[1])
 
+    # kappa can be scalar / [R] / [D] / [R,D]
     if hasattr(model, "log_kappa"):
         kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+        kappa_RD = _to_R_D_param(kappa, R, D, like=th, name="kappa")
     else:
-        kappa = xt.new_tensor(6.0)
+        kappa_RD = th.new_full((R, D), 6.0)
 
+    # inequality direction
     if hasattr(model, "ineq_sign_param"):
-        ineq = torch.tanh(model.ineq_sign_param)
+        ineq_raw = torch.tanh(model.ineq_sign_param)
     elif hasattr(model, "ineq"):
-        ineq = torch.tanh(model.ineq)
+        ineq_raw = torch.tanh(model.ineq)
     else:
-        ineq = torch.ones_like(th)
+        ineq_raw = th.new_ones(R, D)
+    ineq_RD = _to_R_D_param(ineq_raw, R, D, like=th, name="ineq")
 
+    # evidence sign
     if hasattr(model, "e_sign_param"):
-        es = torch.tanh(model.e_sign_param)
+        es_raw = torch.tanh(model.e_sign_param)
     elif hasattr(model, "esign"):
-        es = torch.tanh(model.esign)
+        es_raw = torch.tanh(model.esign)
     else:
-        es = torch.ones_like(th)
+        es_raw = th.new_ones(R, D)
+    es_RD = _to_R_D_param(es_raw, R, D, like=th, name="esign")
 
+    # mask
     if hasattr(model, "mask_logit"):
-        m = torch.sigmoid(model.mask_logit)
+        m_raw = torch.sigmoid(model.mask_logit)
     elif hasattr(model, "mask"):
-        m = torch.sigmoid(model.mask)
+        m_raw = torch.sigmoid(model.mask)
     else:
-        m = torch.ones_like(th)
+        m_raw = th.new_ones(R, D)
+    m_RD = _to_R_D_param(m_raw, R, D, like=th, name="mask")
 
+    # optional margin
     margin = None
     if hasattr(model, "margin_param"):
         try:
             margin = torch.nn.functional.softplus(model.margin_param)
         except Exception:
             margin = None
+    if margin is not None and isinstance(margin, torch.Tensor):
+        margin_RD = _to_R_D_param(margin, R, D, like=th, name="margin")
+    else:
+        margin_RD = None
 
-    expr = ineq[None, :, :] * (xt[:, None, :] - th[None, :, :])
-    if margin is not None and isinstance(margin, torch.Tensor) and margin.shape == th.shape:
-        expr = expr - margin[None, :, :]
-    c = torch.sigmoid(kappa * expr)  # [1,R,D]
+    expr = ineq_RD[None, :, :] * (xt[:, None, :] - th[None, :, :])
+    if margin_RD is not None:
+        expr = expr - margin_RD[None, :, :]
 
-    evidence = (m[None, :, :] * es[None, :, :] * (2.0 * c - 1.0)).sum(dim=2)  # [1,R]
-    count = (m[None, :, :] * c).sum(dim=2)  # [1,R]
+    c = torch.sigmoid(kappa_RD[None, :, :] * expr)  # [1,R,D]
+    evidence = (m_RD[None, :, :] * es_RD[None, :, :] * (2.0 * c - 1.0)).sum(dim=2)  # [1,R]
+    count = (m_RD[None, :, :] * c).sum(dim=2)  # [1,R]
 
     # K-of-N gating if present
     if hasattr(model, "k_frac_param"):
         t_e = _get_rule_threshold_t(model, R, like=th)
-        msum = (m.sum(dim=1)[None, :] + 1e-6)
+        msum = (m_RD.sum(dim=1)[None, :] + 1e-6)
         k = torch.sigmoid(model.k_frac_param)[None, :] * msum
-
         alpha = float(getattr(model, "alpha", getattr(model, "beta_group", 6.0)))
         beta_k = float(getattr(model, "beta_k", getattr(model, "beta", 8.0)))
-
         z = torch.sigmoid(alpha * (evidence - t_e[None, :])) * torch.sigmoid(beta_k * (count - k))
         return z[0].clamp(0.0, 1.0)
 
@@ -1215,7 +1269,11 @@ def _generic_evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> tor
 
 def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
     """Return z: [R] for EvidenceNet-like models (output_dim independent)."""
-    # EvidenceNet / MarginEvidenceNet-ish pattern
+    # If it looks K-of-N-ish, generic is safest (covers GroupEvidenceKofNNet variants)
+    if hasattr(model, "th") and hasattr(model, "k_frac_param"):
+        return _generic_evidence_like_rule_activations(model, xt)
+
+    # EvidenceNet / MarginEvidenceNet-ish
     if hasattr(model, "th") and hasattr(model, "ineq_sign_param") and hasattr(model, "e_sign_param") and hasattr(model, "mask_logit"):
         kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0) if hasattr(model, "log_kappa") else xt.new_tensor(6.0)
         ineq = torch.tanh(model.ineq_sign_param)
@@ -1224,33 +1282,37 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
             c = torch.sigmoid(kappa * (ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]) - margin[None, :, :]))
         else:
             c = torch.sigmoid(kappa * ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]))
-
         m = torch.sigmoid(model.mask_logit)[None, :, :]
         es = torch.tanh(model.e_sign_param)[None, :, :]
         evidence = (m * es * (2.0 * c - 1.0)).sum(dim=2)  # [1,R]
 
         beta = float(getattr(model, "beta", 6.0))
-
-        # FIX: GroupEvidenceKofNNet may not have .t; use best-effort t vector
         R = int(model.th.shape[0])
         t = _get_rule_threshold_t(model, R, like=model.th)
-
         z = torch.sigmoid(beta * (evidence - t[None, :]))
         return z[0]
 
-    # PerFeatureKappaEvidenceNet
+    # PerFeatureKappaEvidenceNet (and GroupContrastNet-like attribute pattern)
     if hasattr(model, "th") and hasattr(model, "ineq") and hasattr(model, "esign") and hasattr(model, "mask") and hasattr(model, "log_kappa"):
-        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)  # [R,D]
-        ineq = torch.tanh(model.ineq)
-        c = torch.sigmoid(kappa[None, :, :] * ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]))
-        m = torch.sigmoid(model.mask)[None, :, :]
-        es = torch.tanh(model.esign)[None, :, :]
-        evidence = (m * es * (2.0 * c - 1.0)).sum(dim=2)
+        th = model.th
+        if not isinstance(th, torch.Tensor) or th.ndim != 2:
+            return _generic_evidence_like_rule_activations(model, xt)
+
+        R, D = int(th.shape[0]), int(th.shape[1])
+
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+        kappa_RD = _to_R_D_param(kappa, R, D, like=th, name="kappa")
+
+        ineq_RD = _to_R_D_param(torch.tanh(model.ineq), R, D, like=th, name="ineq")
+        es_RD = _to_R_D_param(torch.tanh(model.esign), R, D, like=th, name="esign")
+        m_RD = _to_R_D_param(torch.sigmoid(model.mask), R, D, like=th, name="mask")
+
+        expr = kappa_RD[None, :, :] * ineq_RD[None, :, :] * (xt[:, None, :] - th[None, :, :])
+        c = torch.sigmoid(expr)  # [1,R,D]
+        evidence = (m_RD[None, :, :] * es_RD[None, :, :] * (2.0 * c - 1.0)).sum(dim=2)  # [1,R]
 
         beta = float(getattr(model, "beta", 6.0))
-        R = int(model.th.shape[0])
-        t = _get_rule_threshold_t(model, R, like=model.th)
-
+        t = _get_rule_threshold_t(model, R, like=th)
         z = torch.sigmoid(beta * (evidence - t[None, :]))
         return z[0]
 
@@ -1265,12 +1327,11 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
         sev = (c * w[None, None, None, :]).sum(dim=3) / w.sum()  # [1,R,D]
         m = torch.sigmoid(model.mask)[None, :, :]
         es = torch.tanh(model.esign)[None, :, :]
-        evidence = (m * es * (2.0 * sev - 1.0)).sum(dim=2)
+        evidence = (m * es * (2.0 * sev - 1.0)).sum(dim=2)  # [1,R]
 
         beta = float(getattr(model, "beta", 6.0))
         R = int(model.th0.shape[0])
         t = _get_rule_threshold_t(model, R, like=model.th0)
-
         z = torch.sigmoid(beta * (evidence - t[None, :]))
         return z[0]
 
@@ -1285,30 +1346,20 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
         m = torch.sigmoid(model.mask)[None, :, :]
         el = torch.tanh(model.e_low)[None, :, :]
         eh = torch.tanh(model.e_high)[None, :, :]
-        evidence = (m * (el * (2.0 * low - 1.0) + eh * (2.0 * high - 1.0))).sum(dim=2)
+        evidence = (m * (el * (2.0 * low - 1.0) + eh * (2.0 * high - 1.0))).sum(dim=2)  # [1,R]
 
         beta = float(getattr(model, "beta", 6.0))
         R = int(model.center.shape[0])
         t = _get_rule_threshold_t(model, R, like=model.center)
-
         z = torch.sigmoid(beta * (evidence - t[None, :]))
         return z[0]
 
-    # EvidenceKofNNet
+    # EvidenceKofNNet (classic)
     if hasattr(model, "th") and hasattr(model, "k_frac_param") and hasattr(model, "t_e") and hasattr(model, "head"):
-        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
-        ineq = torch.tanh(model.ineq_sign_param)
-        c = torch.sigmoid(kappa * ineq[None, :, :] * (xt[:, None, :] - model.th[None, :, :]))
-        m = torch.sigmoid(model.mask_logit)
-        es = torch.tanh(model.e_sign_param)
-        evidence = (m[None, :, :] * es[None, :, :] * (2.0 * c - 1.0)).sum(dim=2)
-        count = (m[None, :, :] * c).sum(dim=2)
-        msum = (m.sum(dim=1)[None, :] + 1e-6)
-        k = torch.sigmoid(model.k_frac_param)[None, :] * msum
-        z = torch.sigmoid(float(model.alpha) * (evidence - model.t_e[None, :])) * torch.sigmoid(float(model.beta) * (count - k))
-        return z[0]
+        # (Usually already caught by the k_frac early return)
+        return _generic_evidence_like_rule_activations(model, xt)
 
-    # Generic fallback (covers Group* evidence-like models)
+    # Generic fallback (covers GroupSoftMinNet, GroupRingNet, etc)
     if hasattr(model, "th"):
         return _generic_evidence_like_rule_activations(model, xt)
 
@@ -1458,7 +1509,7 @@ def global_rules_df(
                     }
                 )
             return pd.DataFrame(rows)
-        # if no rules extracted, fall through
+        # else fall through
 
     # Corner family
     if isinstance(
@@ -1697,11 +1748,15 @@ def local_contrib_df(
     ):
         with torch.no_grad():
             z = _evidence_like_rule_activations(model, xt)  # [R]
-            W = model.head.weight
-            if W.ndim == 2:
-                w = W[class_idx]
+            if hasattr(model, "head") and hasattr(model.head, "weight"):
+                W = model.head.weight
+                if W.ndim == 2:
+                    w = W[class_idx]
+                else:
+                    w = W
             else:
-                w = W
+                # last resort if some model variant has no head
+                w = z.new_ones(z.shape[0])
             contrib = (z * w).detach().cpu().numpy()
 
         global_rules = _extract_evidence_rules(
@@ -1727,7 +1782,7 @@ def local_contrib_df(
                     "rule_idx": r,
                     "contribution": float(contrib[r]),
                     "activation": float(z[r].detach().cpu().item()),
-                    "weight": float(w[r].detach().cpu().item()),
+                    "weight": float(w[r].detach().cpu().item()) if isinstance(w, torch.Tensor) else float(w[r]),
                     "rule_text": render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
                     "direction": "increases" if contrib[r] > 0 else "decreases",
                 }
@@ -1784,7 +1839,7 @@ def local_contrib_df(
             )
         return pd.DataFrame(rows), meta
 
-    # RegimeRulesNet (pi-weighted)
+    # RegimeRulesNet (pi-weighted rule contributions)
     if isinstance(model, (C["RegimeRulesNet"],)):
         if not (hasattr(model, "_regime_group_evidence") and hasattr(model, "regime_gate") and hasattr(model, "rules")):
             df = global_rules_df(
@@ -1861,7 +1916,7 @@ def local_contrib_df(
 
         return pd.DataFrame(rows), meta
 
-    # Forest family
+    # Forest family (tree contributions)
     if isinstance(
         model,
         (
@@ -1921,7 +1976,7 @@ def local_contrib_df(
             )
         return pd.DataFrame(rows), meta
 
-    # Fallback: global rules, with 0 contrib
+    # Fallback: global rules with zero contributions
     df = global_rules_df(
         model,
         feature_names,
@@ -2016,7 +2071,7 @@ def export_global_rules(
             f.write(f"Global rules for {type(model).__name__}\n")
             f.write("=" * 60 + "\n\n")
             for _, row in df.iterrows():
-                f.write(f"Rule {int(row['rule_idx'])} ({row['direction']} prediction):\n")
+                f.write(f"Rule {int(row['rule_idx'])} ({row.get('direction','unknown')} prediction):\n")
                 f.write(f"  Weight: {float(row['weight']):+,.6f}\n")
                 f.write(f"  IF {row['rule_text']}\n\n")
 
@@ -2030,7 +2085,7 @@ def export_global_rules(
                     "rule_idx": int(row["rule_idx"]),
                     "weight": float(row["weight"]),
                     "rule_text": str(row["rule_text"]),
-                    "direction": str(row["direction"]),
+                    "direction": str(row.get("direction", "unknown")),
                 }
             )
         with open(path, "w", encoding="utf-8") as f:
