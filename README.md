@@ -5,10 +5,10 @@
 [![Python ≥3.10](https://img.shields.io/badge/Python-3.10%2B-green)](https://www.python.org/)
 [![PyTorch ≥2.1](https://img.shields.io/badge/PyTorch-2.1%2B-orange)](https://pytorch.org/)
 
-**Nous** (Greek: νοῦς, "mind") is a neuro-symbolic library for **interpretable learning** in PyTorch. It provides models whose predictions flow through **facts** and **rules**, with explanations that are *honest by construction*—derived from recomputing forward passes under controlled interventions, not post-hoc gradient approximations.
+**Nous** (Greek: νοῦς, “mind”) is a neuro-symbolic library for **interpretable learning** in PyTorch. Nous models are built from **facts** and **rules**, and explanations are derived from the model’s computation via **intervention-style forward evaluation** (not post-hoc gradients).
 
-> **Design principle:** features → facts → rules → prediction  
-> **Explanation method:** counterfactual forward evaluation
+> **Design:** features → facts → rules → prediction  
+> **Explanations:** recompute forward passes under controlled rule/fact interventions
 
 ---
 
@@ -27,32 +27,24 @@ pip install "nous[dev]"
 
 ---
 
-## Core Concepts
+## Core Concepts (short)
 
-Nous models are composed of modular, interpretable components:
-
-| Component | Description |
-|-----------|-------------|
-| **Facts** | Differentiable feature transforms (threshold facts, β-facts) mapping inputs to [0,1] |
-| **Rules** | Soft logical compositions (AND/OR/k-of-n/NOT) with learnable selection |
-| **Gating** | Sparse rule activation via hard top-k or differentiable gates |
-| **Heads** | Linear or prototype-based prediction layers |
-
-**Honest explanations** are grounded in the model's computation:
-- Drop a rule → recompute → measure prediction change
-- Freeze active rules → recompute → measure sufficiency
-- Prune activations → recompute → measure fidelity
+| Concept | Meaning |
+|---|---|
+| **Facts** | Differentiable feature transforms (e.g., thresholds) producing values in \[0,1] |
+| **Rules** | Soft logical compositions (AND/OR/k-of-n/NOT) over facts |
+| **Gating** | Sparse rule selection / activation |
+| **Heads** | Prediction layer (binary, regression, multiclass) |
 
 ---
 
-## Quick Start
+## Quick Start (SoftLogitAND)
 
-**SoftLogitAND** is the recommended model for tabular tasks—balancing accuracy, stability, and interpretability.
+SoftLogitAND is a strong default for tabular tasks when you want a clean rules-first structure.
 
 ```python
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -61,246 +53,205 @@ from nous.training import train_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Prepare data (SoftLogitAND expects scaled inputs)
+# X_train, y_train, X_val, y_val are numpy arrays
 scaler = StandardScaler().fit(X_train)
-X_train_scaled = scaler.transform(X_train).astype("float32")
-X_val_scaled   = scaler.transform(X_val).astype("float32")
+Xtr = scaler.transform(X_train).astype("float32")
+Xva = scaler.transform(X_val).astype("float32")
 
-# Initialize model
 model = SoftLogitAND(
-    input_dim=X_train_scaled.shape[1],
+    input_dim=Xtr.shape[1],
     n_rules=256,
     n_thresh_per_feat=4,
     tau=0.7,
     use_negations=True,
 )
-model.init_from_data(X_train_scaled)  # thresholds from empirical quantiles
+model.init_from_data(Xtr)
 model.to(device)
 
-# Loaders
 train_loader = DataLoader(
-    TensorDataset(
-        torch.tensor(X_train_scaled),
-        torch.tensor(y_train, dtype=torch.float32),
-    ),
-    batch_size=512,
-    shuffle=True,
-    drop_last=False,
+    TensorDataset(torch.tensor(Xtr), torch.tensor(y_train, dtype=torch.float32)),
+    batch_size=512, shuffle=True
 )
 val_loader = DataLoader(
-    TensorDataset(
-        torch.tensor(X_val_scaled),
-        torch.tensor(y_val, dtype=torch.float32),
-    ),
-    batch_size=512,
-    shuffle=False,
-    drop_last=False,
+    TensorDataset(torch.tensor(Xva), torch.tensor(y_val, dtype=torch.float32)),
+    batch_size=512, shuffle=False
 )
 
-# Train
-best_val = train_model(
+train_model(
     model=model,
     train_loader=train_loader,
     val_loader=val_loader,
     criterion=nn.BCEWithLogitsLoss(),
     optimizer=torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4),
-    epochs=300,
-    patience=30,
+    epochs=200,
+    patience=25,
     device=device,
-    clip_grad_max_norm=1.0,
-    zero_grad_set_to_none=True,
-    loss_average="sample",
-    print_l0=False,
 )
-print("best val loss:", best_val)
 ```
 
 ---
 
-### SoftLogitAND (single-rule computation)
+## Model Zoo (high level)
 
-```mermaid
-flowchart TB
-  subgraph Inputs
-    f["Facts: f in [0,1]^F0"]
-  end
-
-  f --> aug["Literals: L = [f, 1-f]<br/>(if use_negations)"]
-
-  subgraph Rule_r["Rule r"]
-    sel["Selector logits: sel_logits_r"]
-    p["p_r = softmax(sel_logits_r / tau)"]
-    bias["Bias: b_r"]
-  end
-
-  sel --> p
-  aug --> logitL["logit(L)"]
-  logitL --> dot["score_r = logit(L) * p_r - b_r"]
-  p --> dot
-  bias --> dot
-  dot --> z["z_r = sigmoid(score_r)"]
-```
+| Family | Examples |
+|---|---|
+| Evidence-style | `EvidenceNet`, `MarginEvidenceNet`, `PerFeatureKappaEvidenceNet` |
+| Grouped logic | `GroupEvidenceKofNNet`, `GroupSoftMinNet`, `GroupContrastNet` |
+| Regimes | `RegimeRulesNet` |
+| Differentiable forests | `PredicateForest`, `ObliviousForest`, `GroupFirstForest`, `BudgetedForest` |
 
 ---
 
-## Explanation API
+## Model Zoo: minimal interpretation example (global + local)
 
-### Local explanations with cluster themes (SoftLogitAND)
+This is the “notebook-style” workflow, but **kept small**: train a zoo_v2 model, predict, then extract:
 
-```python
-from nous import SoftLogitANDPosthocExplainer
-
-explainer = SoftLogitANDPosthocExplainer(
-    model=model,
-    feature_names=feature_names,
-    x_scaler=scaler,   # required if you pass raw (unscaled) x to report()
-    k_rules=10,
-    n_clusters=16,
-)
-
-explainer.fit_posthoc(X_ref_scaled=X_train_scaled)
-
-report = explainer.report(x_raw, y_true01=float(y_true), x_is_scaled=False)
-print(report.markdown)                  # Human-readable explanation
-df = report.tables["cluster_themes"]    # Structured rule clusters (DataFrame)
-```
-
-### Intervention-based analysis (NousNet)
-
-```python
-from nous import rule_impact_df, minimal_sufficient_explanation, suggest_rule_counterfactuals
-
-impacts = rule_impact_df(model, x, feature_names)
-mse = minimal_sufficient_explanation(model, x, feature_names)
-cfs = suggest_rule_counterfactuals(model, x, feature_names, target="flip")
-```
-
----
-
-## Model Zoo
-
-| Model | Description |
-|-------|-------------|
-| **SoftLogitAND** | Threshold facts + logit-AND rules (recommended baseline) |
-| **SoftLogicInteraction** | Low-rank interaction facts before logit-AND rules |
-| **SegmentMoE** | Mixture-of-experts with soft-logic gating |
-| **HierarchicalMoE** | SegmentMoE gating with SoftLogitAND experts |
-| **NousFamilies** | Rule aggregation into stable families for governance |
-
----
-
-## Export (NousNet → NumPy)
-
-Export is currently implemented for **`NousNet`** models (including `soft_fact` layers and rule gaters), producing a self-contained NumPy inference module and validating parity vs PyTorch.
+- **global rules** (`global_rules_df`)
+- **local contributions** (`local_contrib_df`)
+- **text explanation** (`explain_prediction`)
+- optional export (`export_global_rules`)
 
 ```python
 import numpy as np
-from nous import NousNet
-from nous.export import export_numpy_inference, load_numpy_module, validate_numpy_vs_torch
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
 
-model = NousNet(
-    input_dim=8,
-    num_outputs=3,
-    task_type="classification",
-    num_facts=12,
-    rules_per_layer=(8,),
-    rule_selection_method="soft_fact",
-    use_calibrators=False,
+from nous.zoo_v2 import EvidenceNet
+from nous.explain.zoo_v2 import global_rules_df, local_contrib_df, explain_prediction, export_global_rules
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Assume:
+#   X_train_raw: (N, D) float numpy
+#   y_train: (N,) in {0,1}
+#   feature_names: list[str] length D
+
+# 1) Scale for training (common for zoo_v2)
+scaler = StandardScaler().fit(X_train_raw)
+X_train = scaler.transform(X_train_raw).astype("float32")
+
+# 2) Train a zoo_v2 model (binary classification => output_dim=1)
+model = EvidenceNet(input_dim=X_train.shape[1], n_rules=128, init_kappa=6.0, beta=6.0, output_dim=1).to(device)
+opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
+loss_fn = nn.BCEWithLogitsLoss()
+
+Xt = torch.tensor(X_train, device=device)
+yt = torch.tensor(y_train, dtype=torch.float32, device=device)
+
+model.train()
+for _ in range(100):
+    opt.zero_grad(set_to_none=True)
+    logits = model(Xt).view(-1)
+    loss = loss_fn(logits, yt)
+    loss.backward()
+    opt.step()
+
+# 3) Predict (probability)
+model.eval()
+with torch.no_grad():
+    p0 = torch.sigmoid(model(Xt[:1]).view(-1)).item()
+print("pred_proba(x0):", p0)
+
+# 4) Interpret
+# For explain helpers: pass X_ref and x in the *pre-scaler* space if you provide scaler=...
+X_ref = X_train_raw[:5000]
+x0_raw = X_train_raw[0]
+
+df_g = global_rules_df(
+    model,
+    feature_names,
+    scaler=scaler,          # makes thresholds readable in the raw/original feature space
+    X_ref=X_ref,
+    readability="clinical",
+    top_rules=12,
+    top_feats=4,
+    n_trees=6,              # used by forest-style models; safe to keep for others
 )
+print(df_g.head())
 
-X = np.random.randn(64, 8).astype(np.float32)
+df_l, meta = local_contrib_df(
+    model,
+    x0_raw,                 # raw x (pre-scaler) because scaler=... is provided
+    feature_names,
+    scaler=scaler,
+    X_ref=X_ref,
+    readability="clinical",
+    top_rules=12,
+)
+print("local meta:", meta)
+print(df_l.head())
 
-export_numpy_inference(model, file_path="infer.py")
-npmod = load_numpy_module("infer.py")
+print(explain_prediction(
+    model, x0_raw, feature_names,
+    scaler=scaler, X_ref=X_ref,
+    readability="clinical", top_rules=8
+))
 
-report = validate_numpy_vs_torch(model, npmod, X, task="classification", n=32)
-print(report)
+# 5) Optional: export global rules
+export_global_rules(model, feature_names, path="rules.txt",  format="txt",  scaler=scaler, X_ref=X_ref, readability="clinical", top_rules=30, top_feats=4, n_trees=6)
+export_global_rules(model, feature_names, path="rules.json", format="json", scaler=scaler, X_ref=X_ref, readability="clinical", top_rules=30, top_feats=4, n_trees=6)
 ```
 
 ---
 
-## Example Results (synthetic + sanity checks)
+## Real‑world Benchmarks (5‑Fold CV)
 
-Nous does not yet ship a full benchmark suite. For transparency, we report an illustrative experiment from
-`examples/softlogit_synthetic.py`: a controlled synthetic binary classification task with **hidden ground‑truth rules**
-and **correlated decoy features** (to stress interpretability).
+These are small reference runs (mean ± std across folds) comparing selected Nous (torch) models with **XGBoost** and **EBM**. They are provided as sanity/reference points.
 
-### Predictive metrics (vs common baselines)
+### QSAR Fish Toxicity (Regression)
 
-Below is a representative run comparing SoftLogitAND against strong baselines (EBM and XGBoost).
-This is *not* a general benchmark claim; it is provided as an internal validation and demonstration of the workflow.
+| model | kind | time_sec_mean | RMSE (mean±std) | MAE (mean±std) | R² (mean±std) |
+|---|---|---:|---:|---:|---:|
+| XGB(depth=6) *(best XGB)* | sklearn_xgb | 0.662 | **0.904±0.038** | **0.648±0.029** | **0.612±0.031** |
+| EBM(interactions=30) *(best EBM)* | sklearn_ebm | 4.783 | 0.912±0.041 | 0.656±0.039 | 0.605±0.028 |
+| BudgetedForest(k=3,trees=32,depth=4) | torch | 8.861 | 0.927±0.022 | 0.673±0.016 | 0.591±0.042 |
+| EvidenceNet | torch | 7.219 | 0.942±0.034 | 0.683±0.018 | 0.575±0.059 |
+| GroupContrastNet | torch | 9.783 | 0.945±0.016 | 0.687±0.032 | 0.574±0.040 |
+| GroupEvidenceKofNNet | torch | 12.349 | 0.956±0.033 | 0.689±0.023 | 0.565±0.042 |
+| GroupFirstForest(trees=32,depth=4) | torch | 9.208 | 0.929±0.029 | 0.671±0.025 | 0.589±0.044 |
+| GroupSoftMinNet | torch | 9.982 | 0.921±0.035 | 0.672±0.033 | 0.595±0.048 |
+| MarginEvidenceNet | torch | 6.123 | 0.938±0.025 | 0.681±0.022 | 0.579±0.057 |
+| ObliviousForest(trees=32,depth=4) | torch | 11.227 | 0.965±0.048 | 0.690±0.018 | 0.557±0.046 |
+| PerFeatureKappaEvidenceNet | torch | 7.534 | 0.952±0.031 | 0.687±0.015 | 0.566±0.065 |
+| PredicateForest(trees=32,depth=4) | torch | 11.297 | 0.965±0.048 | 0.690±0.018 | 0.557±0.046 |
+| RegimeRulesNet | torch | 8.914 | 0.930±0.040 | 0.680±0.028 | 0.587±0.051 |
 
-| model        | split | auc      | acc      | logloss   |
-|-------------|-------|----------|----------|-----------|
-| EBM         | test  | 0.678388 | 0.621167 | 0.627355  |
-| XGBoost     | test  | 0.674476 | 0.628000 | 0.625940  |
-| SoftLogitAND| test  | 0.673156 | 0.630167 | 0.628430  |
-| XGBoost     | train | 0.837673 | 0.750381 | 0.565467  |
-| EBM         | train | 0.750905 | 0.683286 | 0.590412  |
-| SoftLogitAND| train | 0.708272 | 0.649571 | 0.608605  |
-| SoftLogitAND| val   | 0.693072 | 0.648667 | 0.617313  |
-| EBM         | val   | 0.692212 | 0.639667 | 0.621746  |
-| XGBoost     | val   | 0.689324 | 0.644333 | 0.620255  |
+### Concrete Compressive Strength (Regression)
 
-**Interpretation.** On this task, SoftLogitAND is competitive with strong baselines on test performance while providing
-a strictly rule‑based structure and direct intervention-based explanations. For this reason, SoftLogitAND is the
-recommended default model in Nous when you want a strong accuracy/interpretability trade-off.
+| model | kind | time_sec_mean | RMSE (mean±std) | MAE (mean±std) | R² (mean±std) |
+|---|---|---:|---:|---:|---:|
+| EBM(interactions=30) *(best EBM)* | sklearn_ebm | 20.506 | **3.966±0.375** | 2.779±0.228 | **0.943±0.011** |
+| XGB(depth=6) *(best XGB)* | sklearn_xgb | 3.419 | 4.194±0.366 | 2.681±0.186 | 0.936±0.013 |
+| BudgetedForest(k=3,trees=32,depth=4) | torch | 30.789 | 6.198±0.271 | 4.689±0.156 | 0.861±0.016 |
+| EvidenceNet | torch | 16.476 | 4.153±0.335 | 2.757±0.227 | 0.938±0.009 |
+| GroupContrastNet | torch | 21.682 | 4.176±0.359 | 2.781±0.226 | 0.937±0.010 |
+| GroupEvidenceKofNNet | torch | 18.880 | 4.176±0.382 | 2.809±0.276 | 0.937±0.010 |
+| GroupFirstForest(trees=32,depth=4) | torch | 28.413 | 10.565±3.227 | 8.399±2.821 | 0.567±0.268 |
+| GroupSoftMinNet | torch | 29.670 | 4.275±0.442 | 2.886±0.322 | 0.934±0.014 |
+| MarginEvidenceNet | torch | 24.249 | 4.052±0.368 | **2.681±0.222** | 0.941±0.009 |
+| ObliviousForest(trees=32,depth=4) | torch | 31.236 | 7.752±1.612 | 6.060±1.349 | 0.774±0.094 |
+| PerFeatureKappaEvidenceNet | torch | 16.744 | 4.195±0.465 | 2.727±0.308 | 0.936±0.014 |
+| PredicateForest(trees=32,depth=4) | torch | 31.166 | 7.752±1.612 | 6.060±1.349 | 0.774±0.094 |
+| RegimeRulesNet | torch | 33.734 | 4.469±0.474 | 3.006±0.374 | 0.928±0.015 |
 
-### Logic sanity check: ground-truth rules firing for a sample
+### Myocardial Infarction Complications (Multiclass)
 
-Since the dataset is generated by known rules, we can verify which ground‑truth rules are satisfied for any input `x`.
-Example output for one sample:
-
-| truth_rule | weight | conds |
-|---|---|---|
-| R1_pos | 2.4 | [(3, '>', 0.7), (17, '<=', -0.2)] |
-| R2_pos | 2.0 | [(55, '>', 0.0), (120, '<=', 0.0), (7, '>', 0.0)] |
-| R3_neg | -2.0 | [(10, '<=', -1.2), (11, '<=', -0.8)] |
-| R4_pos | 1.2 | [(80, '>', 0.3), (81, '>', 0.3)] |
-
-This check is useful when interpreting local rule explanations: it clarifies whether the underlying “true” mechanism is active.
-
-### Feature recovery @K (global importance vs ground truth)
-
-Because the generating rules depend on a small set of true features, we can measure how well global importance
-recovers the ground-truth feature set.
-
-For SoftLogitAND we use:
-`expl.global_feature_importance_mass_weighted(split="train")`.
-
-Representative results:
-
-- **K=10**
-  - SoftLogitAND: precision@K=0.90, recall@K=1.00, jaccard=0.90
-  - EBM (fixed):  precision@K=0.80, recall@K=0.889, jaccard=0.727
-  - XGBoost:      precision@K=0.90, recall@K=1.00, jaccard=0.90
-
-- **K=20**
-  - SoftLogitAND: precision@K=0.45, recall@K=1.00, jaccard=0.45
-  - EBM (fixed):  precision@K=0.45, recall@K=1.00, jaccard=0.45
-  - XGBoost:      precision@K=0.45, recall@K=1.00, jaccard=0.45
-
-- **K=40**
-  - SoftLogitAND: precision@K=0.30, recall@K=1.00, jaccard=0.30
-  - EBM (fixed):  precision@K=0.225, recall@K=1.00, jaccard=0.225
-  - XGBoost:      precision@K=0.225, recall@K=1.00, jaccard=0.225
-
-### Counterfactual test (truth-rule ON vs OFF) on SoftLogitAND
-
-A particularly strong sanity check is counterfactual manipulation: we force each ground-truth rule to be satisfied (ON)
-or violated (OFF) by moving only the features involved in that rule, then measure the change in the model’s predicted probability.
-
-Mean effect (forcing rule ON vs OFF) for the trained SoftLogitAND model:
-
-| rule  | truth_weight | mean Δprob (ON − OFF) |
-|-------|-------------:|-----------------------:|
-| R1_pos| +2.4         | +0.366704 |
-| R2_pos| +2.0         | +0.323780 |
-| R3_neg| −2.0         | −0.204971 |
-| R4_pos| +1.2         | +0.232676 |
-
-**Interpretation.** The sign and relative magnitude of the counterfactual effects align with the generating rule weights,
-supporting the claim that SoftLogitAND learns a meaningful rule-level causal structure on this synthetic task.
+| model | kind | time_sec_mean | logloss (mean±std) | acc (mean±std) | f1_macro (mean±std) | auc_ovr (mean±std) |
+|---|---|---:|---:|---:|---:|---:|
+| MarginEvidenceNet *(best Nous here)* | torch | 3.369 | **0.525±0.025** | 0.864±0.006 | 0.184±0.007 | **0.833±0.028** |
+| XGB(depth=4) *(best XGB)* | sklearn_xgb | 1.534 | 0.545±0.025 | **0.865±0.006** | 0.183±0.009 | 0.815±0.043 |
+| EBM(interactions=30) *(best EBM)* | sklearn_ebm | 80.716 | 0.547±0.027 | 0.863±0.004 | 0.184±0.010 | 0.809±0.040 |
+| EvidenceNet | torch | 2.974 | 0.536±0.028 | 0.861±0.008 | 0.180±0.011 | 0.819±0.035 |
+| GroupContrastNet | torch | 15.010 | 0.536±0.028 | 0.864±0.010 | 0.184±0.009 | 0.823±0.032 |
+| GroupEvidenceKofNNet | torch | 13.212 | 0.534±0.027 | 0.862±0.007 | 0.181±0.009 | 0.826±0.033 |
+| GroupFirstForest(trees=32,depth=4) | torch | 6.020 | 0.540±0.034 | 0.865±0.007 | 0.188±0.011 | 0.821±0.036 |
+| GroupSoftMinNet | torch | 27.423 | 0.596±0.100 | 0.855±0.014 | 0.157±0.039 | 0.827±0.033 |
+| BudgetedForest(k=3,trees=32,depth=4) | torch | 5.528 | 0.571±0.012 | 0.861±0.011 | 0.191±0.032 | 0.775±0.024 |
+| ObliviousForest(trees=32,depth=4) | torch | 5.927 | 0.543±0.025 | 0.862±0.010 | 0.192±0.021 | 0.825±0.031 |
+| PerFeatureKappaEvidenceNet | torch | 2.967 | 0.535±0.027 | 0.861±0.007 | 0.179±0.009 | 0.820±0.036 |
+| PredicateForest(trees=32,depth=4) | torch | 5.923 | 0.543±0.025 | 0.862±0.010 | 0.192±0.021 | 0.825±0.031 |
+| RegimeRulesNet | torch | 4.407 | 0.547±0.026 | 0.858±0.008 | 0.179±0.009 | 0.819±0.029 |
 
 ---
 
