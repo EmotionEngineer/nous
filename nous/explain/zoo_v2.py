@@ -481,7 +481,12 @@ def _infer_n_thresh_per_feat(fb: Any, D: int) -> Optional[int]:
 
 
 def _threshold_layout_from_factbank(fb: Any, D: int) -> Optional[Tuple[int, int]]:
-    """Infer (D,K) for axis threshold banks where facts are D*K."""
+    """Infer (D,K) for axis threshold banks where facts are D*K.
+
+    Handles both:
+    - th shaped [D,K]
+    - th shaped [D*K] (flattened)
+    """
     if hasattr(fb, "th"):
         th = fb.th
         shp = tuple(th.shape) if isinstance(th, torch.Tensor) else tuple(np.asarray(th).shape)
@@ -503,7 +508,7 @@ def _threshold_layout_from_factbank(fb: Any, D: int) -> Optional[Tuple[int, int]
 
 
 def _axis_threshold_value(fb: Any, j: int, k: int, D: Optional[int] = None) -> float:
-    """Get threshold value from axis threshold fact bank."""
+    """Get threshold value from axis threshold fact bank (supports 2D or flattened 1D th)."""
     th = fb.th
 
     def _infer_D() -> int:
@@ -580,9 +585,7 @@ def _extract_threshold_facts(
             out.append(
                 {
                     "fact_idx": int(i),
-                    "clauses": [
-                        Clause(base=base, kind="numeric", op=">=", value=float(thr_u), raw_feature=raw_feat, feature_index=j)
-                    ],
+                    "clauses": [Clause(base=base, kind="numeric", op=">=", value=float(thr_u), raw_feature=raw_feat, feature_index=j)],
                 }
             )
         return out
@@ -598,9 +601,7 @@ def _extract_threshold_facts(
                 out.append(
                     {
                         "fact_idx": int(j * K + k),
-                        "clauses": [
-                            Clause(base=base, kind="numeric", op=">=", value=float(thr_u), raw_feature=raw_feat, feature_index=j)
-                        ],
+                        "clauses": [Clause(base=base, kind="numeric", op=">=", value=float(thr_u), raw_feature=raw_feat, feature_index=j)],
                     }
                 )
         return out
@@ -878,7 +879,6 @@ def _forest_get_leaf_value(model: Any) -> Optional[torch.Tensor]:
 
 
 def _forest_get_facts_module(model: Any) -> Optional[Any]:
-    # must be callable (nn.Module / function)
     for n in ["facts", "base_facts", "axis", "fact_bank", "facts_layer"]:
         if hasattr(model, n):
             v = getattr(model, n)
@@ -889,7 +889,6 @@ def _forest_get_facts_module(model: Any) -> Optional[Any]:
 
 def _infer_depth_from_leaf(leaf_value: torch.Tensor) -> Optional[int]:
     try:
-        # leaf_value: [T,L] or [T,L,C]
         if leaf_value.ndim == 2:
             L = int(leaf_value.shape[1])
         elif leaf_value.ndim == 3:
@@ -906,19 +905,87 @@ def _infer_depth_from_leaf(leaf_value: torch.Tensor) -> Optional[int]:
         return None
 
 
-# ===== Global extraction: Forest-family =====
-
 def _sel_probs(logits: torch.Tensor, selector: str, tau: float = 0.7, dim: int = -1) -> torch.Tensor:
     if selector == "sparsemax":
         return sparsemax(logits, dim=dim)
     return torch.softmax(logits / max(float(tau), 1e-6), dim=dim)
 
 
-def _decode_fact_index_to_jk(
-    facts: Any,
-    D: int,
-    base_idx: int,
-) -> Tuple[int, int, Optional[float]]:
+def _forest_reshape_sel(sel_logits: torch.Tensor, T: int, depth: int, selector: str, tau: float) -> torch.Tensor:
+    """
+    Return selection probabilities as [T,depth,Fin] for either:
+    - sel_logits [T,depth,Fin]
+    - sel_logits [T*depth,Fin]
+    """
+    if sel_logits.ndim == 3:
+        return _sel_probs(sel_logits, selector=selector, tau=tau, dim=2).view(T, depth, -1)
+
+    if sel_logits.ndim != 2:
+        raise ValueError("Unsupported sel_logits ndim for forest.")
+
+    Fin = int(sel_logits.shape[1])
+    sel = _sel_probs(sel_logits, selector=selector, tau=tau, dim=1)
+    if sel.shape[0] < T * depth:
+        T = int(sel.shape[0] // max(depth, 1))
+    return sel[: T * depth].view(T, depth, Fin)
+
+
+@torch.no_grad()
+def _forest_leaf_probs_and_outputs(model: Any, xt: torch.Tensor, class_idx: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute:
+      leaf_probs: [T,L]
+      y_t: [T]
+
+    Works across forest variants with sel_logits/fact_logits and facts/base_facts.
+    """
+    facts = _forest_get_facts_module(model)
+    sel_logits = _forest_get_sel_logits(model)
+    leaf = _forest_get_leaf_value(model)
+    if facts is None or sel_logits is None or leaf is None:
+        raise TypeError("Model missing forest attributes (facts/sel_logits/leaf_value).")
+
+    selector = str(getattr(model, "selector", "sparsemax"))
+    tau = float(getattr(model, "tau_select", 0.7))
+
+    depth = int(getattr(model, "depth", 0) or 0)
+    T = int(getattr(model, "T", 0) or getattr(model, "n_trees", 0) or 0)
+
+    if depth <= 0:
+        d0 = _infer_depth_from_leaf(leaf)
+        depth = int(d0) if d0 is not None else 4
+
+    if T <= 0:
+        if leaf.ndim >= 2:
+            T = int(leaf.shape[0])
+        elif sel_logits.ndim == 3:
+            T = int(sel_logits.shape[0])
+        else:
+            T = int(sel_logits.shape[0] // max(depth, 1))
+
+    f = facts(xt)  # [1,F0]
+    f_aug = torch.cat([f, 1.0 - f], dim=1)
+
+    sel = _forest_reshape_sel(sel_logits, T=T, depth=depth, selector=selector, tau=tau)  # [T,depth,Fin]
+    p = torch.einsum("bf,tdf->btd", f_aug, sel).clamp(1e-6, 1 - 1e-6)  # [1,T,depth]
+
+    probs = xt.new_ones(1, T, 1)
+    for d in range(depth):
+        pd = p[:, :, d].unsqueeze(-1)
+        probs = torch.cat([probs * (1.0 - pd), probs * pd], dim=2)  # [1,T,L]
+
+    # y_t
+    if leaf.ndim == 2:
+        y_t = (probs * leaf[None, :, :]).sum(dim=2)  # [1,T]
+        return probs[0], y_t[0]
+
+    c = int(class_idx)
+    c = max(0, min(c, leaf.shape[-1] - 1))
+    y_t = torch.einsum("btl,tl->bt", probs, leaf[:, :, c])  # [1,T]
+    return probs[0], y_t[0]
+
+
+def _decode_fact_index_to_jk(facts: Any, D: int, base_idx: int) -> Tuple[int, int, Optional[float]]:
     """Decode a base fact index into (feature j, thresh k, thr_value)."""
     if isinstance(facts, MultiResAxisFactBank):
         K = int(facts.K)
@@ -939,32 +1006,35 @@ def _decode_fact_index_to_jk(
     return j, k, float(thr)
 
 
-def _extract_forest_rules(
+def _extract_forest_rule_for_tree(
     model: Any,
+    tree_idx: int,
     feature_names: Sequence[str],
-    scaler: Optional[Any] = None,
-    readability: Readability = "clinical",
-    n_trees: int = 6,
-    X_ref: Optional[np.ndarray] = None,
-) -> List[Dict[str, Any]]:
-    """Extract crisp (approximate) rules from forest models."""
+    *,
+    scaler: Optional[Any],
+    X_ref: Optional[np.ndarray],
+    leaf_idx: Optional[int] = None,
+    class_idx: int = 0,
+) -> Dict[str, Any]:
+    """
+    Decode a single tree into a crisp rule.
+
+    - selector per depth: argmax
+    - leaf_idx: if provided, decode that leaf path (local explanation);
+              else choose leaf with max |leaf_value| (global-ish).
+    """
+    facts = _forest_get_facts_module(model)
     sel_logits = _forest_get_sel_logits(model)
     leaf = _forest_get_leaf_value(model)
-    facts = _forest_get_facts_module(model)
-
-    if sel_logits is None or leaf is None or facts is None:
-        return []
+    if facts is None or sel_logits is None or leaf is None:
+        raise TypeError("Model missing forest attributes (facts/sel_logits/leaf_value).")
 
     D = len(feature_names)
     is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
 
-    sel_logits = sel_logits.detach()
-    leaf = leaf.detach()
-
     selector = str(getattr(model, "selector", "sparsemax"))
     tau = float(getattr(model, "tau_select", 0.7))
 
-    # infer depth/T
     depth = int(getattr(model, "depth", 0) or 0)
     T = int(getattr(model, "T", 0) or getattr(model, "n_trees", 0) or 0)
 
@@ -980,77 +1050,129 @@ def _extract_forest_rules(
         else:
             T = int(sel_logits.shape[0] // max(depth, 1))
 
-    # sel_logits layout
-    if sel_logits.ndim == 3:
-        # [T,depth,Fin]
-        sel = _sel_probs(sel_logits, selector=selector, tau=tau, dim=2).detach().cpu().numpy()
-        sel = sel.reshape(T, depth, -1)
-        Fin = int(sel.shape[2])
-    else:
-        # [T*depth,Fin]
-        if sel_logits.ndim != 2:
-            return []
-        Fin = int(sel_logits.shape[1])
-        sel = _sel_probs(sel_logits, selector=selector, tau=tau, dim=1).cpu().numpy()
-        if sel.shape[0] < T * depth:
-            T = int(sel.shape[0] // max(depth, 1))
-        sel = sel[: T * depth].reshape(T, depth, Fin)
+    if tree_idx < 0 or tree_idx >= T:
+        raise IndexError("tree_idx out of range.")
 
+    sel = _forest_reshape_sel(sel_logits, T=T, depth=depth, selector=selector, tau=tau)  # [T,depth,Fin]
+    sel_t = sel[int(tree_idx)]  # [depth,Fin]
+    topf = [int(torch.argmax(sel_t[d]).detach().cpu().item()) for d in range(depth)]
+
+    Fin = int(sel_t.shape[1])
     F0 = Fin // 2
 
-    leaf_np = leaf.detach().cpu().numpy()
-    leaf_score = leaf_np[:, :, 0] if leaf_np.ndim == 3 else leaf_np
+    # pick leaf
+    leaf_tensor = leaf
+    if leaf_tensor.ndim == 3:
+        c = max(0, min(int(class_idx), int(leaf_tensor.shape[-1] - 1)))
+        leaf_score_vec = leaf_tensor[int(tree_idx), :, c]
+    else:
+        leaf_score_vec = leaf_tensor[int(tree_idx), :]
+
+    if leaf_idx is None:
+        li = int(torch.argmax(torch.abs(leaf_score_vec)).detach().cpu().item())
+    else:
+        li = int(leaf_idx)
+
+    L = int(leaf_score_vec.numel())
+    li = max(0, min(li, L - 1))
+    lv = float(leaf_score_vec[li].detach().cpu().item())
+
+    clauses: List[Clause] = []
+    for d in range(depth):
+        bit = (li >> (depth - 1 - d)) & 1
+        f_idx = int(topf[d])
+        is_neg = f_idx >= F0
+        base_idx = f_idx - F0 if is_neg else f_idx
+
+        j, _k, thr_scaled = _decode_fact_index_to_jk(facts, D, base_idx)
+        if j < 0 or j >= D:
+            continue
+
+        raw_feat = feature_names[j]
+        sp = _split_ohe(raw_feat)
+        base = sp[0] if sp else raw_feat
+
+        want_literal_true = (bit == 1)
+        if not is_neg:
+            op = ">=" if want_literal_true else "<="
+        else:
+            op = "<=" if want_literal_true else ">="
+
+        # If we couldn't decode a threshold value, skip clause (avoids NaNs/?? in text).
+        if thr_scaled is None and (not (bool(is_bin[j]) and sp is not None)):
+            continue
+
+        if bool(is_bin[j]) and sp is not None:
+            want_one = op in (">", ">=")
+            clauses.append(
+                Clause(
+                    base=base,
+                    kind="category",
+                    op=("==" if want_one else "!="),
+                    value=sp[1],
+                    raw_feature=raw_feat,
+                    feature_index=j,
+                )
+            )
+        else:
+            thr_u = _unscale_value(j, float(thr_scaled), scaler) if thr_scaled is not None else float("nan")
+            clauses.append(
+                Clause(
+                    base=base,
+                    kind="numeric",
+                    op=op,
+                    value=float(thr_u),
+                    raw_feature=raw_feat,
+                    feature_index=j,
+                )
+            )
+
+    return {
+        "tree_idx": int(tree_idx),
+        "leaf_idx": int(li),
+        "leaf_score": float(lv),
+        "clauses": clauses,
+    }
+
+
+def _extract_forest_rules(
+    model: Any,
+    feature_names: Sequence[str],
+    scaler: Optional[Any] = None,
+    readability: Readability = "clinical",
+    n_trees: int = 6,
+    X_ref: Optional[np.ndarray] = None,
+) -> List[Dict[str, Any]]:
+    """Extract crisp (approximate) rules from forest models (global view)."""
+    sel_logits = _forest_get_sel_logits(model)
+    leaf = _forest_get_leaf_value(model)
+    facts = _forest_get_facts_module(model)
+    if sel_logits is None or leaf is None or facts is None:
+        return []
+
+    depth = int(getattr(model, "depth", 0) or 0)
+    T = int(getattr(model, "T", 0) or getattr(model, "n_trees", 0) or 0)
+    if depth <= 0:
+        d0 = _infer_depth_from_leaf(leaf)
+        depth = int(d0) if d0 is not None else 4
+    if T <= 0:
+        T = int(leaf.shape[0]) if leaf.ndim >= 2 else int(sel_logits.shape[0] // max(depth, 1))
 
     rules: List[Dict[str, Any]] = []
     for t in range(min(int(n_trees), int(T))):
-        sel_t = sel[t]  # [depth,Fin]
-        topf = [int(np.argmax(sel_t[d])) for d in range(depth)]
-
-        li = int(np.argmax(np.abs(leaf_score[t])))
-        lv = float(leaf_score[t, li])
-
-        clauses: List[Clause] = []
-        for d in range(depth):
-            bit = (li >> (depth - 1 - d)) & 1
-
-            f_idx = int(topf[d])
-            is_neg = f_idx >= F0
-            base_idx = f_idx - F0 if is_neg else f_idx
-
-            j, _k, thr_scaled = _decode_fact_index_to_jk(facts, D, base_idx)
-            if j < 0 or j >= D:
-                continue
-
-            raw_feat = feature_names[j]
-            sp = _split_ohe(raw_feat)
-            base = sp[0] if sp else raw_feat
-
-            want_literal_true = (bit == 1)
-            if not is_neg:
-                op = ">=" if want_literal_true else "<="
-            else:
-                op = "<=" if want_literal_true else ">="
-
-            if bool(is_bin[j]) and sp is not None:
-                want_one = op in (">", ">=")
-                clauses.append(
-                    Clause(base=base, kind="category", op=("==" if want_one else "!="), value=sp[1], raw_feature=raw_feat, feature_index=j)
-                )
-            else:
-                thr_u = float("nan") if thr_scaled is None else _unscale_value(j, float(thr_scaled), scaler)
-                clauses.append(Clause(base=base, kind="numeric", op=op, value=float(thr_u), raw_feature=raw_feat, feature_index=j))
-
-        rules.append(
-            {
-                "tree_idx": int(t),
-                "leaf_idx": int(li),
-                "leaf_score": float(lv),
-                "clauses": clauses,
-                "direction": "increases" if lv > 0 else "decreases",
-            }
+        rr = _extract_forest_rule_for_tree(
+            model,
+            t,
+            feature_names,
+            scaler=scaler,
+            X_ref=X_ref,
+            leaf_idx=None,  # choose max |leaf|
+            class_idx=0,
         )
+        rr["direction"] = "increases" if rr["leaf_score"] > 0 else "decreases"
+        rules.append(rr)
 
-    rules.sort(key=lambda rr: abs(rr["leaf_score"]), reverse=True)
+    rules.sort(key=lambda rr: abs(rr.get("leaf_score", 0.0)), reverse=True)
     return rules
 
 
@@ -1220,13 +1342,12 @@ def _generic_evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> tor
 
 
 def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
-    """Return z: [R] for EvidenceNet-like / group-evidence-like models."""
-    # safest for K-of-N-ish group models
+    """Return z:[R] for evidence-like models."""
     if hasattr(model, "th") and hasattr(model, "k_frac_param"):
         return _generic_evidence_like_rule_activations(model, xt)
 
-    # EvidenceNet-like signature
     if hasattr(model, "th") and hasattr(model, "ineq_sign_param") and hasattr(model, "e_sign_param") and hasattr(model, "mask_logit"):
+        # also safe: use generic t accessor
         kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0) if hasattr(model, "log_kappa") else xt.new_tensor(6.0)
         ineq = torch.tanh(model.ineq_sign_param)
         if hasattr(model, "margin_param"):
@@ -1244,11 +1365,9 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
         z = torch.sigmoid(beta * (evidence - t[None, :]))
         return z[0]
 
-    # PerFeatureKappaEvidenceNet-like signature (GroupContrastNet falls here)
     if hasattr(model, "th") and hasattr(model, "ineq") and hasattr(model, "esign") and hasattr(model, "mask") and hasattr(model, "log_kappa"):
         return _generic_evidence_like_rule_activations(model, xt)
 
-    # fallback
     if hasattr(model, "th"):
         return _generic_evidence_like_rule_activations(model, xt)
 
@@ -1256,7 +1375,7 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
 
 
 def _corner_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
-    """Return z: [R] for CornerNet-like models."""
+    """Return z:[R] for CornerNet-like models."""
     if hasattr(model, "th") and hasattr(model, "sign_param") and hasattr(model, "mask_logit") and hasattr(model, "log_kappa"):
         z, _, _ = corner_product_z(xt, model.th, model.sign_param, model.mask_logit, model.log_kappa)
         return z[0]
@@ -1284,64 +1403,6 @@ def _corner_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
         return z[0]
 
     raise TypeError("Unsupported corner-like model for local rule activations.")
-
-
-def _forest_tree_outputs(model: Any, xt: torch.Tensor, class_idx: int = 0) -> torch.Tensor:
-    """Compute per-tree outputs for forest family (for a single sample). Returns [T]."""
-    facts = _forest_get_facts_module(model)
-    sel_logits = _forest_get_sel_logits(model)
-    leaf = _forest_get_leaf_value(model)
-
-    if facts is None or sel_logits is None or leaf is None:
-        raise TypeError("Model missing forest attributes (facts/sel_logits/leaf_value).")
-
-    f = facts(xt)
-    f_aug = torch.cat([f, 1.0 - f], dim=1)
-
-    selector = str(getattr(model, "selector", "sparsemax"))
-    tau = float(getattr(model, "tau_select", 0.7))
-
-    leaf = leaf
-    sel_logits = sel_logits
-
-    depth = int(getattr(model, "depth", 0) or 0)
-    T = int(getattr(model, "T", 0) or getattr(model, "n_trees", 0) or 0)
-
-    if depth <= 0:
-        d0 = _infer_depth_from_leaf(leaf)
-        depth = int(d0) if d0 is not None else 4
-
-    if T <= 0:
-        if leaf.ndim >= 2:
-            T = int(leaf.shape[0])
-        elif sel_logits.ndim == 3:
-            T = int(sel_logits.shape[0])
-        else:
-            T = int(sel_logits.shape[0] // max(depth, 1))
-
-    # selector probs
-    if sel_logits.ndim == 3:
-        # [T,depth,Fin]
-        sel = _sel_probs(sel_logits, selector=selector, tau=tau, dim=2).view(T, depth, -1)
-    else:
-        sel = _sel_probs(sel_logits, selector=selector, tau=tau, dim=1).view(T, depth, -1)
-
-    # p: [1,T,depth]
-    p = torch.einsum("bf,tdf->btd", f_aug, sel).clamp(1e-6, 1 - 1e-6)
-
-    probs = xt.new_ones(1, T, 1)
-    for d in range(depth):
-        pd = p[:, :, d].unsqueeze(-1)
-        probs = torch.cat([probs * (1.0 - pd), probs * pd], dim=2)  # [1,T,L]
-
-    if leaf.ndim == 2:
-        y_t = (probs * leaf[None, :, :]).sum(dim=2)  # [1,T]
-        return y_t[0]
-
-    c = int(class_idx)
-    c = max(0, min(c, leaf.shape[-1] - 1))
-    y_t = torch.einsum("btl,tl->bt", probs, leaf[:, :, c])  # [1,T]
-    return y_t[0]
 
 
 def _make_signed_evidence_adapter(rules_layer: Any, weight_vec: torch.Tensor) -> Any:
@@ -1421,7 +1482,6 @@ def global_rules_df(
                     }
                 )
             return pd.DataFrame(rows)
-        # else fall through to other handlers/fallbacks
 
     # Corner family
     if isinstance(
@@ -1455,7 +1515,7 @@ def global_rules_df(
             )
         return pd.DataFrame(rows)
 
-    # Forest family (includes GroupFirstForest; now robust to attr-name differences)
+    # Forest family
     if isinstance(
         model,
         (
@@ -1644,10 +1704,7 @@ def local_contrib_df(
             z = _evidence_like_rule_activations(model, xt)  # [R]
             if hasattr(model, "head") and hasattr(model.head, "weight"):
                 W = model.head.weight
-                if W.ndim == 2:
-                    w = W[class_idx]
-                else:
-                    w = W
+                w = W[class_idx] if W.ndim == 2 else W
             else:
                 w = z.new_ones(z.shape[0])
             contrib = (z * w).detach().cpu().numpy()
@@ -1694,12 +1751,9 @@ def local_contrib_df(
         ),
     ):
         with torch.no_grad():
-            z = _corner_like_rule_activations(model, xt)
+            z = _corner_like_rule_activations(model, xt)  # [R]
             W = model.head.weight
-            if W.ndim == 2:
-                w = W[class_idx]
-            else:
-                w = W
+            w = W[class_idx] if W.ndim == 2 else W
             contrib = (z * w).detach().cpu().numpy()
 
         global_rules = _extract_corner_rules(
@@ -1732,7 +1786,7 @@ def local_contrib_df(
             )
         return pd.DataFrame(rows), meta
 
-    # RegimeRulesNet (pi-weighted rule contributions)
+    # RegimeRulesNet (pi-weighted)
     if isinstance(model, (C["RegimeRulesNet"],)):
         if not (hasattr(model, "_regime_group_evidence") and hasattr(model, "regime_gate") and hasattr(model, "rules")):
             df = global_rules_df(
@@ -1809,7 +1863,7 @@ def local_contrib_df(
 
         return pd.DataFrame(rows), meta
 
-    # Forest family (tree contributions) — now robust for GroupFirstForest attribute names
+    # Forest family (tree contributions) — FIXED: no NaNs/unknowns
     if isinstance(
         model,
         (
@@ -1823,15 +1877,17 @@ def local_contrib_df(
         ),
     ):
         with torch.no_grad():
-            y_t = _forest_tree_outputs(model, xt, class_idx=class_idx)  # [T]
+            leaf_probs, y_t = _forest_leaf_probs_and_outputs(model, xt, class_idx=class_idx)  # [T,L], [T]
 
-            # AttentiveForest: apply attention weights as contribution scaling
+            # Default contribution is tree output; AttentiveForest scales by attention weights.
             if isinstance(model, C["AttentiveForest"]) and hasattr(model, "att"):
                 facts = _forest_get_facts_module(model)
-                if facts is not None:
+                sel_logits = _forest_get_sel_logits(model)
+                leaf = _forest_get_leaf_value(model)
+                if facts is not None and sel_logits is not None and leaf is not None:
                     f = facts(xt)
                     f_aug = torch.cat([f, 1.0 - f], dim=1)
-                    a_logits = model.att(f_aug)  # [1,T]
+                    a_logits = model.att(f_aug)  # [1,T] (typically)
                     selector = str(getattr(model, "selector", "sparsemax"))
                     a = _sel_probs(a_logits, selector=selector, tau=float(getattr(model, "tau_select", 0.7)), dim=1)[0]
                     contrib_t = (a * y_t).detach().cpu().numpy()
@@ -1840,27 +1896,35 @@ def local_contrib_df(
             else:
                 contrib_t = y_t.detach().cpu().numpy()
 
-        global_rules = _extract_forest_rules(
-            model,
-            feature_names,
-            scaler=scaler,
-            readability=readability,
-            n_trees=int(min(int(top_rules), int(getattr(model, "T", len(contrib_t))) or len(contrib_t))),
-            X_ref=X_ref,
-        )
-
+        # Choose top trees by |contribution|
         idxs = np.argsort(-np.abs(contrib_t))[: int(top_rules)]
+
+        # For each selected tree, decode the *local* most probable leaf and the corresponding path rule.
+        leaf_val = _forest_get_leaf_value(model)
         rows = []
         for i in idxs:
             t = int(i)
-            rr = next((g for g in global_rules if int(g.get("tree_idx", -1)) == t), None)
-            rule_text = ""
+            li = int(torch.argmax(leaf_probs[t]).detach().cpu().item())
+
+            # leaf_score for display (class-specific if needed)
             leaf_score = float("nan")
-            direction = "unknown"
-            if rr is not None:
-                rule_text = render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order)
-                leaf_score = float(rr.get("leaf_score", float("nan")))
-                direction = rr.get("direction", "unknown")
+            if leaf_val is not None:
+                if leaf_val.ndim == 2:
+                    leaf_score = float(leaf_val[t, li].detach().cpu().item())
+                elif leaf_val.ndim == 3:
+                    c = max(0, min(int(class_idx), int(leaf_val.shape[-1] - 1)))
+                    leaf_score = float(leaf_val[t, li, c].detach().cpu().item())
+
+            rr = _extract_forest_rule_for_tree(
+                model,
+                t,
+                feature_names,
+                scaler=scaler,
+                X_ref=X_ref,
+                leaf_idx=li,          # local leaf
+                class_idx=class_idx,
+            )
+            rule_text = render_rule(rr["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order)
 
             rows.append(
                 {
@@ -1869,12 +1933,14 @@ def local_contrib_df(
                     "tree_output": float(y_t[t].detach().cpu().item()),
                     "leaf_score": leaf_score,
                     "rule_text": rule_text,
-                    "direction": direction,
+                    # direction should reflect signed contribution to logit
+                    "direction": "increases" if float(contrib_t[t]) > 0 else "decreases",
                 }
             )
+
         return pd.DataFrame(rows), meta
 
-    # Fallback: return global rules with zero contributions
+    # Fallback: global rules with zero contributions
     df = global_rules_df(
         model,
         feature_names,
