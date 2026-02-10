@@ -628,10 +628,9 @@ def _extract_threshold_facts(
             )
         return out
 
-    # MultiResAxisFactBank: thresholds stored as [D,K], but facts are S*D*K (multiple kappas).
+    # MultiResAxisFactBank
     if isinstance(facts, MultiResAxisFactBank):
         K = int(facts.K)
-        # Create one clause per (d,k) (ignoring kappa resolution) as "fact templates"
         for j in range(D):
             for k in range(K):
                 raw_feat = feature_names[j]
@@ -667,8 +666,6 @@ def _extract_threshold_facts(
             base = sp[0] if sp else raw_feat
             for k in range(K):
                 thr_u = _unscale_value(j, _axis_threshold_value(facts, j, k, D=D), scaler)
-                # If OHE binary, map ">= threshold" into ==/!= semantics is not robust globally.
-                # Keep numeric representation unless it clearly looks OHE-binary.
                 if bool(is_bin[j]) and sp is not None:
                     out.append(
                         {
@@ -732,7 +729,7 @@ def _classes():
         MultiResForest,
         GroupFirstForest,
         BudgetedForest,
-        # group evidence (global only fallback to evidence-like is okay)
+        # group evidence
         GroupEvidenceKofNNet,
         SoftGroupEvidenceKofNNet,
         GroupSoftMinNet,
@@ -761,17 +758,12 @@ def _extract_evidence_rules(
     D = len(feature_names)
     is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
 
-    # Identify parameterization
     th = getattr(model, "th", None)
     if th is None:
         return []
     th = th.detach().cpu().numpy()  # [R,Dm]
     R, Dm = th.shape
-    if Dm != D:
-        # still try best-effort: only decode min(D,Dm)
-        D_use = min(D, Dm)
-    else:
-        D_use = D
+    D_use = min(D, Dm)
 
     # ineq sign
     if hasattr(model, "ineq_sign_param"):
@@ -804,14 +796,12 @@ def _extract_evidence_rules(
     if W.ndim == 1:
         w = W
     else:
-        # choose class
         c = int(class_idx) if class_idx is not None else 0
         c = max(0, min(c, W.shape[0] - 1))
         w = W[c]
 
     rules: List[Dict[str, Any]] = []
     for r in range(R):
-        # rank features for this rule
         score = mask[r, :D_use] * (0.6 + 0.4 * np.abs(es[r, :D_use]))
         fidx = np.argsort(-score)[: int(top_feats)]
 
@@ -822,9 +812,7 @@ def _extract_evidence_rules(
             sp = _split_ohe(raw_feat)
             base = sp[0] if sp else raw_feat
 
-            # Base inequality direction from ineq
             op_base = ">=" if ineq[r, j] >= 0 else "<="
-            # Evidence sign flips the "desired" direction
             op = op_base if es[r, j] >= 0 else ("<=" if op_base == ">=" else ">=")
 
             thr_u = _unscale_value(j, float(th[r, j]), scaler)
@@ -862,7 +850,7 @@ def _extract_evidence_rules(
             }
         )
 
-    # NOTE: sorted for global display; local_contrib_df should map by rule_idx (not list position).
+    # sorted for global display
     rules.sort(key=lambda rr: abs(rr["weight"]), reverse=True)
     return rules
 
@@ -889,7 +877,6 @@ def _extract_corner_rules(
     R, Dm = th.shape
     D_use = min(D, Dm)
 
-    # sign direction (ineq)
     if hasattr(model, "sign_param"):
         ineq = np.tanh(model.sign_param.detach().cpu().numpy())
     elif hasattr(model, "sign_c"):
@@ -897,7 +884,6 @@ def _extract_corner_rules(
     else:
         ineq = np.ones_like(th)
 
-    # mask
     if hasattr(model, "mask_logit"):
         mask = torch.sigmoid(model.mask_logit).detach().cpu().numpy()
     elif hasattr(model, "mask"):
@@ -961,7 +947,6 @@ def _extract_corner_rules(
             }
         )
 
-    # NOTE: sorted for global display; local_contrib_df should map by rule_idx (not list position).
     rules.sort(key=lambda rr: abs(rr["weight"]), reverse=True)
     return rules
 
@@ -979,11 +964,7 @@ def _decode_fact_index_to_jk(
     D: int,
     base_idx: int,
 ) -> Tuple[int, int, Optional[float]]:
-    """Decode a base fact index (0..F0-1) into (feature j, thresh k, thr_value).
-
-    Supports ThresholdFactBank-like and MultiResAxisFactBank layouts.
-    """
-    # MultiResAxisFactBank flattening is [S,D,K] with K=facts.K
+    """Decode a base fact index (0..F0-1) into (feature j, thresh k, thr_value)."""
     if isinstance(facts, MultiResAxisFactBank):
         K = int(facts.K)
         tmp = int(base_idx // K)
@@ -992,7 +973,6 @@ def _decode_fact_index_to_jk(
         thr = float(facts.th[j, k].detach().cpu().item())
         return j, k, thr
 
-    # ThresholdFactBank: assume D*K facts with per-feature contiguous block
     layout = _threshold_layout_from_factbank(facts, D)
     if layout is None:
         j = int(base_idx % D)
@@ -1012,10 +992,7 @@ def _extract_forest_rules(
     n_trees: int = 6,
     X_ref: Optional[np.ndarray] = None,
 ) -> List[Dict[str, Any]]:
-    """Extract crisp (approximate) rules from forest models by:
-    - argmax selector per depth
-    - choose leaf with largest |leaf_value| per tree
-    """
+    """Extract crisp (approximate) rules from forest models."""
     if not hasattr(model, "sel_logits") or not hasattr(model, "leaf_value") or not hasattr(model, "facts"):
         return []
 
@@ -1031,10 +1008,7 @@ def _extract_forest_rules(
     selector = str(getattr(model, "selector", "sparsemax"))
     tau = float(getattr(model, "tau_select", 0.7))
 
-    # Infer T/depth if not present
     if T is None or depth is None or T <= 0 or depth <= 0:
-        # sel_logits is [T*depth, Fin]
-        # if depth exists use it; else guess depth=4
         depth = depth or 4
         T = sel_logits.shape[0] // depth
 
@@ -1045,25 +1019,19 @@ def _extract_forest_rules(
     sel = sel.reshape(T, depth, Fin)
 
     leaf_np = leaf.cpu().numpy()
-    # leaf_np: [T,L] or [T,L,C]
-    if leaf_np.ndim == 3:
-        # choose class 0 by default for global
-        leaf_score = leaf_np[:, :, 0]
-    else:
-        leaf_score = leaf_np
+    leaf_score = leaf_np[:, :, 0] if leaf_np.ndim == 3 else leaf_np
 
     rules: List[Dict[str, Any]] = []
     for t in range(min(int(n_trees), int(T))):
-        sel_t = sel[t]  # [depth,Fin]
+        sel_t = sel[t]
         topf = [int(np.argmax(sel_t[d])) for d in range(depth)]
 
-        # pick leaf with max |value|
         li = int(np.argmax(np.abs(leaf_score[t])))
         lv = float(leaf_score[t, li])
 
         clauses: List[Clause] = []
         for d in range(depth):
-            bit = (li >> (depth - 1 - d)) & 1  # 1 => go "right" => literal true
+            bit = (li >> (depth - 1 - d)) & 1
 
             f_idx = int(topf[d])
             is_neg = f_idx >= F0
@@ -1077,16 +1045,10 @@ def _extract_forest_rules(
             sp = _split_ohe(raw_feat)
             base = sp[0] if sp else raw_feat
 
-            # literal truth table:
-            # - if selector chooses f (x>=thr), literal true => x>=thr
-            # - if selector chooses (1-f) (x<thr), literal true => x<=thr
-            # leaf bit=1 wants literal true, bit=0 wants literal false.
             want_literal_true = (bit == 1)
             if not is_neg:
-                # literal is f
                 op = ">=" if want_literal_true else "<="
             else:
-                # literal is (1-f)
                 op = "<=" if want_literal_true else ">="
 
             if bool(is_bin[j]) and sp is not None:
@@ -1149,12 +1111,6 @@ def _predict_logits(model: Any, x_scaled_2d: np.ndarray) -> np.ndarray:
     return np.asarray(y).reshape(-1)
 
 
-def _pick_class(logits: np.ndarray) -> int:
-    if logits.size <= 1:
-        return 0
-    return int(np.argmax(logits))
-
-
 def _compute_meta_from_logits(logits: np.ndarray) -> Dict[str, Any]:
     if logits.size <= 1:
         logit = float(logits.ravel()[0])
@@ -1166,6 +1122,93 @@ def _compute_meta_from_logits(logits: np.ndarray) -> Dict[str, Any]:
     z = logits - np.max(logits)
     p = np.exp(z) / (np.exp(z).sum() + 1e-12)
     return {"logit": float(np.max(logits)), "prob": float(p[c]), "prediction": c, "class_idx": c}
+
+
+def _generic_evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
+    """
+    Best-effort rule activations z:[R] for "evidence-ish" models.
+
+    Used for Group* evidence models and any future models that expose a similar
+    parameterization (th + ineq + esign + mask + optional kofN gating) but don't
+    match exact attribute patterns above.
+    """
+    if not hasattr(model, "th"):
+        raise TypeError("Model has no .th; cannot compute evidence-like activations.")
+
+    th = model.th  # [R,D]
+    if not isinstance(th, torch.Tensor) or th.ndim != 2:
+        raise TypeError("Expected model.th to be a 2D torch.Tensor [R,D].")
+
+    if hasattr(model, "log_kappa"):
+        kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
+    else:
+        kappa = xt.new_tensor(6.0)
+
+    if hasattr(model, "ineq_sign_param"):
+        ineq = torch.tanh(model.ineq_sign_param)
+    elif hasattr(model, "ineq"):
+        ineq = torch.tanh(model.ineq)
+    else:
+        ineq = torch.ones_like(th)
+
+    if hasattr(model, "e_sign_param"):
+        es = torch.tanh(model.e_sign_param)
+    elif hasattr(model, "esign"):
+        es = torch.tanh(model.esign)
+    else:
+        es = torch.ones_like(th)
+
+    if hasattr(model, "mask_logit"):
+        m = torch.sigmoid(model.mask_logit)
+    elif hasattr(model, "mask"):
+        m = torch.sigmoid(model.mask)
+    else:
+        m = torch.ones_like(th)
+
+    margin = None
+    if hasattr(model, "margin_param"):
+        try:
+            margin = torch.nn.functional.softplus(model.margin_param)
+        except Exception:
+            margin = None
+
+    expr = ineq[None, :, :] * (xt[:, None, :] - th[None, :, :])
+    if margin is not None and isinstance(margin, torch.Tensor) and margin.shape == th.shape:
+        expr = expr - margin[None, :, :]
+    c = torch.sigmoid(kappa * expr)  # [1,R,D]
+
+    evidence = (m[None, :, :] * es[None, :, :] * (2.0 * c - 1.0)).sum(dim=2)  # [1,R]
+    count = (m[None, :, :] * c).sum(dim=2)  # [1,R]
+
+    # K-of-N gating if present
+    if hasattr(model, "k_frac_param"):
+        if hasattr(model, "t_e"):
+            t_e = model.t_e
+        elif hasattr(model, "t"):
+            t_e = model.t
+        else:
+            t_e = xt.new_zeros(th.shape[0])
+
+        msum = (m.sum(dim=1)[None, :] + 1e-6)
+        k = torch.sigmoid(model.k_frac_param)[None, :] * msum
+
+        alpha = float(getattr(model, "alpha", getattr(model, "beta_group", 6.0)))
+        beta_k = float(getattr(model, "beta_k", getattr(model, "beta", 8.0)))
+
+        z = torch.sigmoid(alpha * (evidence - t_e[None, :])) * torch.sigmoid(beta_k * (count - k))
+        return z[0].clamp(0.0, 1.0)
+
+    # Plain evidence threshold
+    if hasattr(model, "t"):
+        t = model.t
+    elif hasattr(model, "t_e"):
+        t = model.t_e
+    else:
+        t = xt.new_zeros(th.shape[0])
+
+    beta = float(getattr(model, "beta", getattr(model, "beta_rules", 6.0)))
+    z = torch.sigmoid(beta * (evidence - t[None, :]))
+    return z[0].clamp(0.0, 1.0)
 
 
 def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
@@ -1200,7 +1243,6 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
 
     # LadderEvidenceNet
     if hasattr(model, "th0") and hasattr(model, "delta") and hasattr(model, "ineq") and hasattr(model, "esign") and hasattr(model, "mask"):
-        # replicate LadderEvidenceNet._thresholds()
         inc = torch.nn.functional.softplus(model.delta)
         th = torch.cat([model.th0[:, :, None], model.th0[:, :, None] + torch.cumsum(inc, dim=2)], dim=2)  # [R,D,L]
         kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
@@ -1245,23 +1287,24 @@ def _evidence_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tenso
         z = torch.sigmoid(float(model.alpha) * (evidence - model.t_e[None, :])) * torch.sigmoid(float(model.beta) * (count - k))
         return z[0]
 
+    # Generic fallback (covers Group* evidence-like models)
+    if hasattr(model, "th"):
+        return _generic_evidence_like_rule_activations(model, xt)
+
     raise TypeError("Unsupported evidence-like model for local rule activations.")
 
 
 def _corner_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
     """Return z: [R] for CornerNet-like models."""
-    # CornerNet / SoftMinCornerNet / KofNCornerNet
     if hasattr(model, "th") and hasattr(model, "sign_param") and hasattr(model, "mask_logit") and hasattr(model, "log_kappa"):
         z, _, _ = corner_product_z(xt, model.th, model.sign_param, model.mask_logit, model.log_kappa)
         return z[0]
 
-    # RingCornerNet: zo*(1-zi)
     if hasattr(model, "th_o") and hasattr(model, "sign_o") and hasattr(model, "mask_o") and hasattr(model, "th_i"):
         zo, _, _ = corner_product_z(xt, model.th_o, model.sign_o, model.mask_o, model.log_kappa)
         zi, _, _ = corner_product_z(xt, model.th_i, model.sign_i, model.mask_i, model.log_kappa)
         return (zo * (1.0 - zi))[0]
 
-    # HybridCornerIntervalNet
     if hasattr(model, "th_c") and hasattr(model, "sign_c") and hasattr(model, "center") and hasattr(model, "log_width"):
         kappa = torch.exp(model.log_kappa).clamp(0.5, 50.0)
         sgn = torch.tanh(model.sign_c)
@@ -1284,7 +1327,6 @@ def _corner_like_rule_activations(model: Any, xt: torch.Tensor) -> torch.Tensor:
 
 def _forest_tree_outputs(model: Any, xt: torch.Tensor, class_idx: int = 0) -> torch.Tensor:
     """Compute per-tree outputs for forest family (for a single sample). Returns [T]."""
-    # Shared structure: facts -> f_aug -> p selectors -> leaf probs -> leaf mix.
     if not hasattr(model, "facts") or not hasattr(model, "sel_logits") or not hasattr(model, "leaf_value"):
         raise TypeError("Model missing forest attributes.")
 
@@ -1296,19 +1338,19 @@ def _forest_tree_outputs(model: Any, xt: torch.Tensor, class_idx: int = 0) -> to
     depth = int(getattr(model, "depth", 4))
     T = int(getattr(model, "T", model.sel_logits.shape[0] // depth))
 
-    sel = _sel_probs(model.sel_logits, selector=selector, tau=tau, dim=1).view(T, depth, -1)  # [T,depth,Fin]
+    sel = _sel_probs(model.sel_logits, selector=selector, tau=tau, dim=1).view(T, depth, -1)
     p = torch.einsum("bf,tdf->btd", f_aug, sel).clamp(1e-6, 1 - 1e-6)  # [1,T,depth]
 
     probs = xt.new_ones(1, T, 1)
     for d in range(depth):
         pd = p[:, :, d].unsqueeze(-1)
         probs = torch.cat([probs * (1.0 - pd), probs * pd], dim=2)  # [1,T,L]
-    # leaf_value: [T,L] or [T,L,C]
+
     leaf = model.leaf_value
     if leaf.ndim == 2:
         y_t = (probs * leaf[None, :, :]).sum(dim=2)  # [1,T]
         return y_t[0]
-    # multiclass
+
     c = int(class_idx)
     c = max(0, min(c, leaf.shape[-1] - 1))
     y_t = torch.einsum("btl,tl->bt", probs, leaf[:, :, c])  # [1,T]
@@ -1329,7 +1371,6 @@ def _make_signed_evidence_adapter(rules_layer: Any, weight_vec: torch.Tensor) ->
     adapter.t = rules_layer.t
     adapter.beta = float(getattr(rules_layer, "beta", 6.0))
 
-    # fake head with weight shaped [1,R]
     head = type("Head", (), {})()
     head.weight = weight_vec.detach().reshape(1, -1)
     adapter.head = head
@@ -1358,7 +1399,7 @@ def global_rules_df(
     is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
     ohe_groups = _build_ohe_groups(list(feature_names), is_bin)
 
-    # Evidence family
+    # Evidence family (+ Group* evidence models treated as evidence-like)
     if isinstance(
         model,
         (
@@ -1368,6 +1409,11 @@ def global_rules_df(
             C["LadderEvidenceNet"],
             C["BiEvidenceNet"],
             C["EvidenceKofNNet"],
+            C["GroupEvidenceKofNNet"],
+            C["SoftGroupEvidenceKofNNet"],
+            C["GroupSoftMinNet"],
+            C["GroupContrastNet"],
+            C["GroupRingNet"],
         ),
     ):
         rules = _extract_evidence_rules(
@@ -1379,17 +1425,19 @@ def global_rules_df(
             X_ref=X_ref,
             class_idx=class_idx,
         )
-        rows = []
-        for r in rules[: int(top_rules)]:
-            rows.append(
-                {
-                    "rule_idx": r["rule_idx"],
-                    "weight": r["weight"],
-                    "rule_text": render_rule(r["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
-                    "direction": r["direction"],
-                }
-            )
-        return pd.DataFrame(rows)
+        if rules:
+            rows = []
+            for r in rules[: int(top_rules)]:
+                rows.append(
+                    {
+                        "rule_idx": r["rule_idx"],
+                        "weight": r["weight"],
+                        "rule_text": render_rule(r["clauses"], readability, ohe_groups=ohe_groups, base_order=base_order),
+                        "direction": r["direction"],
+                    }
+                )
+            return pd.DataFrame(rows)
+        # if no rules extracted, fall through to other handlers/fallbacks
 
     # Corner family
     if isinstance(
@@ -1456,12 +1504,11 @@ def global_rules_df(
             )
         return pd.DataFrame(rows)
 
-    # RegimeRulesNet (optional global view: show regime "conditions" ranked by prior)
+    # RegimeRulesNet: show regime gate conditions ranked by prior
     if isinstance(model, (C["RegimeRulesNet"],)) and hasattr(model, "th_r") and hasattr(model, "regime_prior"):
         try:
             prior = model.regime_prior.detach()
             pi0 = torch.softmax(prior, dim=0).detach().cpu().numpy()
-            K = int(pi0.shape[0])
 
             th_r = model.th_r.detach().cpu().numpy()  # [K,D]
             ineq_r = np.tanh(model.ineq_r.detach().cpu().numpy())  # [K,D]
@@ -1522,7 +1569,7 @@ def global_rules_df(
         except Exception:
             pass
 
-    # ScorecardWithRules: expose correction rules globally (as an unweighted library)
+    # ScorecardWithRules: expose correction rules globally (unweighted library)
     if isinstance(model, C["ScorecardWithRules"]) and hasattr(model, "rules"):
         rules_layer = model.rules
         adapter = type("EvidenceAdapter", (), {})()
@@ -1534,7 +1581,6 @@ def global_rules_df(
         adapter.t = rules_layer.t
         adapter.beta = float(getattr(rules_layer, "beta", 6.0))
 
-        # Provide a safe dummy head weight vector (zeros), just to decode clauses.
         R = int(rules_layer.th.shape[0])
         head = type("Head", (), {})()
         head.weight = torch.zeros(1, R, device=rules_layer.th.device, dtype=rules_layer.th.dtype)
@@ -1561,7 +1607,7 @@ def global_rules_df(
             )
         return pd.DataFrame(rows)
 
-    # Fallback: threshold facts (not weighted)
+    # Fallback: threshold facts
     facts = _extract_threshold_facts(model, feature_names, scaler=scaler, readability=readability, X_ref=X_ref)
     if facts:
         rows = []
@@ -1603,7 +1649,6 @@ def local_contrib_df(
     meta = _compute_meta_from_logits(logits)
     class_idx = int(meta["class_idx"])
 
-    # build rendering metadata
     base_order = _compute_base_order(list(feature_names))
     is_bin = _feature_is_binary(X_ref) if X_ref is not None else _is_binary_fallback_from_names(feature_names)
     ohe_groups = _build_ohe_groups(list(feature_names), is_bin)
@@ -1612,7 +1657,7 @@ def local_contrib_df(
     device = _device_of(model)
     xt = torch.tensor(x_scaled, dtype=torch.float32, device=device)
 
-    # Evidence family (true local contributions)
+    # Evidence family (+ Group* evidence models)
     if isinstance(
         model,
         (
@@ -1622,11 +1667,16 @@ def local_contrib_df(
             C["LadderEvidenceNet"],
             C["BiEvidenceNet"],
             C["EvidenceKofNNet"],
+            C["GroupEvidenceKofNNet"],
+            C["SoftGroupEvidenceKofNNet"],
+            C["GroupSoftMinNet"],
+            C["GroupContrastNet"],
+            C["GroupRingNet"],
         ),
     ):
         with torch.no_grad():
             z = _evidence_like_rule_activations(model, xt)  # [R]
-            W = model.head.weight  # [C,R] or [1,R]
+            W = model.head.weight  # [C,R] or [1,R] or [R]
             if W.ndim == 2:
                 w = W[class_idx]
             else:
@@ -1663,7 +1713,7 @@ def local_contrib_df(
             )
         return pd.DataFrame(rows), meta
 
-    # Corner family (true local contributions)
+    # Corner family
     if isinstance(
         model,
         (
@@ -1713,7 +1763,7 @@ def local_contrib_df(
             )
         return pd.DataFrame(rows), meta
 
-    # RegimeRulesNet (pi-weighted rule contributions)
+    # RegimeRulesNet (pi-weighted)
     if isinstance(model, (C["RegimeRulesNet"],)):
         if not (hasattr(model, "_regime_group_evidence") and hasattr(model, "regime_gate") and hasattr(model, "rules")):
             df = global_rules_df(
@@ -1732,30 +1782,24 @@ def local_contrib_df(
             return df.head(int(top_rules)), meta
 
         with torch.no_grad():
-            # regime posterior pi
             eg = model._regime_group_evidence(xt)  # [1,K,G]
             z_reg = model.regime_gate(eg).clamp_min(1e-6)  # [1,K]
             logits_k = model.regime_prior[None, :] + torch.log(z_reg)  # [1,K]
             pi = torch.softmax(logits_k, dim=1)[0]  # [K]
 
-            # rule activations
             z_rules = model.rules(xt)[0]  # [R]
 
-            # aggregate head weights under pi (avoid any incorrect sum(dim=2) patterns)
             out_dim = int(getattr(model, "output_dim", 1) or 1)
             if out_dim == 1:
-                # W: [K,R]
                 Wkr = model.W  # [K,R]
                 w_vec = (pi[:, None] * Wkr).sum(dim=0)  # [R]
             else:
-                # W: [K,R,C]
                 c = int(class_idx)
                 Wkrc = model.W[:, :, c]  # [K,R]
                 w_vec = (pi[:, None] * Wkrc).sum(dim=0)  # [R]
 
             contrib = (z_rules * w_vec).detach().cpu().numpy()
 
-        # Render rules using evidence extractor by adapting the signed rule layer
         adapter = _make_signed_evidence_adapter(model.rules, w_vec)
         global_rules = _extract_evidence_rules(
             adapter,
@@ -1786,7 +1830,6 @@ def local_contrib_df(
                 }
             )
 
-        # augment meta with top regimes
         try:
             pi_np = pi.detach().cpu().numpy()
             topk = np.argsort(-pi_np)[: min(5, len(pi_np))]
@@ -1797,7 +1840,7 @@ def local_contrib_df(
 
         return pd.DataFrame(rows), meta
 
-    # Forest family (tree contributions)
+    # Forest family
     if isinstance(
         model,
         (
@@ -1813,13 +1856,12 @@ def local_contrib_df(
         with torch.no_grad():
             y_t = _forest_tree_outputs(model, xt, class_idx=class_idx)  # [T]
 
-            # AttentiveForest: apply attention weights as contribution scaling
             if isinstance(model, C["AttentiveForest"]):
                 f = model.facts(xt)
                 f_aug = torch.cat([f, 1.0 - f], dim=1)
                 a_logits = model.att(f_aug)  # [1,T]
                 selector = str(getattr(model, "selector", "sparsemax"))
-                a = _sel_probs(a_logits, selector=selector, tau=float(getattr(model, "tau_select", 0.7)), dim=1)[0]  # [T]
+                a = _sel_probs(a_logits, selector=selector, tau=float(getattr(model, "tau_select", 0.7)), dim=1)[0]
                 contrib_t = (a * y_t).detach().cpu().numpy()
             else:
                 contrib_t = y_t.detach().cpu().numpy()
@@ -1837,7 +1879,6 @@ def local_contrib_df(
         rows = []
         for i in idxs:
             t = int(i)
-            # find matching global rule for that tree if available
             rr = next((g for g in global_rules if int(g.get("tree_idx", -1)) == t), None)
             rule_text = ""
             leaf_score = float("nan")
@@ -1859,7 +1900,7 @@ def local_contrib_df(
             )
         return pd.DataFrame(rows), meta
 
-    # Fallback: return global rules with zero contributions
+    # Fallback: global rules, with 0 contrib
     df = global_rules_df(
         model,
         feature_names,
